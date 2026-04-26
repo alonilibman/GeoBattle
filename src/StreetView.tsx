@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { importLibrary, setOptions } from '@googlemaps/js-api-loader';
+import GuessMap from './GuessMap';
 
-// הגדרת המפתח
 const API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
 if (API_KEY) {
   setOptions({ key: API_KEY, v: 'weekly' });
@@ -12,28 +12,20 @@ export default function StreetView() {
   const panoInstance = useRef<any>(null);
   const googleServiceRef = useRef<any>(null);
   
-  const [gameState, setGameState] = useState<'START' | 'PLAYING'>('START');
+  const [gameState, setGameState] = useState<'START' | 'PLAYING' | 'RESULT'>('START');
   const [isWarping, setIsWarping] = useState(false);
-  const [diagnostics, setDiagnostics] = useState({
-    googleStatus: 'N/A',
-    lastAction: 'System Standby',
-    locationName: 'Unknown Sector'
-  });
-
-  const updateDiag = (update: Partial<typeof diagnostics>) => {
-    setDiagnostics(prev => ({ ...prev, ...update }));
-  };
+  const [currentGuess, setCurrentGuess] = useState<{lat: number, lng: number} | null>(null);
+  const [actualLocation, setActualLocation] = useState<{lat: number, lng: number} | null>(null);
+  const [distance, setDistance] = useState<number | null>(null);
+  const [roundKey, setRoundKey] = useState(0); // המפתח לאיפוס המפה
 
   useEffect(() => {
     let isMounted = true;
-
-    const initSequence = async () => {
+    const init = async () => {
       try {
         const { StreetViewPanorama, StreetViewService } = await importLibrary('streetView') as any;
         if (!isMounted) return;
-
         googleServiceRef.current = new StreetViewService();
-
         if (mapRef.current && !panoInstance.current) {
           panoInstance.current = new StreetViewPanorama(mapRef.current, {
             position: { lat: 48.8738, lng: 2.2950 },
@@ -42,133 +34,129 @@ export default function StreetView() {
             source: 'outdoor' as any,
             addressControl: false,
             showRoadLabels: false,
-            clickToGo: true,
-          });
-
-          panoInstance.current.addListener('status_changed', () => {
-            updateDiag({ googleStatus: panoInstance.current.getStatus() });
           });
         }
-      } catch (err: any) {
-        updateDiag({ lastAction: `ERROR: ${err.message}` });
-      }
+      } catch (err) { console.error(err); }
     };
-
-    setTimeout(initSequence, 500);
+    setTimeout(init, 500);
     return () => { isMounted = false; };
   }, []);
 
-  // הפונקציה המשופרת לשיגור מיידי
   const handleChaosWarp = async () => {
     if (!googleServiceRef.current || !panoInstance.current) return;
-
-    // 1. החשכה מיידית של המסך
+    
     setIsWarping(true);
-    updateDiag({ lastAction: 'Initiating Warp Drive...' });
+    setGameState('PLAYING');
+    setCurrentGuess(null);
+    setDistance(null);
+    setRoundKey(prev => prev + 1); // כאן אנחנו מודיעים למפה לאפס את עצמה
 
     let found = false;
     let attempts = 0;
-
     while (!found && attempts < 30) {
       attempts++;
-      
-      // הגרלת נ"צ על פני הגלובוס
       const lat = (Math.random() * 140) - 70;
       const lng = (Math.random() * 360) - 180;
-
+      
       try {
         const response = await googleServiceRef.current.getPanorama({
           location: { lat, lng },
-          radius: 100000, // רדיוס של 100 ק"מ לחיפוש מהיר יותר
+          radius: 100000,
           source: 'outdoor' as any
         });
-
-        if (response && response.data && response.data.location) {
-          const newPos = response.data.location.latLng;
-          const locName = response.data.location.description || 'Remote Sector';
-
-          // 2. עדכון המיקום בזמן שהמסך עדיין שחור
-          panoInstance.current.setPosition(newPos);
+        
+        if (response?.data?.location) {
+          const pos = response.data.location.latLng;
+          panoInstance.current.setPosition(pos);
+          setActualLocation({ lat: pos.lat(), lng: pos.lng() });
           panoInstance.current.setPov({ heading: Math.random() * 360, pitch: 0 });
-          
-          updateDiag({ locationName: locName, lastAction: 'Target Locked.' });
           found = true;
-
-          // 3. המתנה קטנה שהטקסטורות ייטענו לפני החשיפה
-          setTimeout(() => {
-            setIsWarping(false);
-          }, 600); 
+          setTimeout(() => setIsWarping(false), 600);
         }
-      } catch (e) {
-        // ממשיך לניסיון הבא
-      }
+      } catch (e) { /* ניסיון נוסף */ }
     }
+  };
 
-    if (!found) {
-      setIsWarping(false);
-      updateDiag({ lastAction: 'Warp Failed: No Signal.' });
-    }
+  const calculateDistance = (p1: any, p2: any) => {
+    const R = 6371; 
+    const dLat = (p2.lat - p1.lat) * Math.PI / 180;
+    const dLng = (p2.lng - p1.lng) * Math.PI / 180;
+    const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+              Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180) * Math.sin(dLng/2) * Math.sin(dLng/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c;
+  };
+
+  const submitGuess = () => {
+    if (!currentGuess || !actualLocation) return;
+    const dist = calculateDistance(currentGuess, actualLocation);
+    setDistance(dist);
+    setGameState('RESULT');
   };
 
   const handleStartGame = () => {
     setGameState('PLAYING');
-    setTimeout(() => {
-      if (panoInstance.current && (window as any).google) {
-        (window as any).google.maps.event.trigger(panoInstance.current, 'resize');
-      }
-    }, 400);
+    handleChaosWarp();
   };
 
   return (
     <div style={{ width: '100vw', height: '100vh', backgroundColor: '#000', position: 'relative', overflow: 'hidden' }}>
       
-      {/* שכבת המפה */}
-      <div 
-        ref={mapRef} 
-        style={{ 
-          width: '100%', height: '100%', position: 'absolute',
-          visibility: gameState === 'PLAYING' ? 'visible' : 'hidden'
-        }} 
-      />
+      <div ref={mapRef} style={{ width: '100%', height: '100%', position: 'absolute' }} />
 
-      {/* --- Warp Overlay: המסך השחור שחוסם את ה"קפיצה" --- */}
-      <div style={{
-        position: 'absolute', inset: 0, zIndex: 2800,
-        backgroundColor: '#000',
-        display: 'flex', justifyContent: 'center', alignItems: 'center',
-        transition: 'opacity 0.4s ease',
-        opacity: isWarping ? 1 : 0,
-        pointerEvents: isWarping ? 'all' : 'none',
-        flexDirection: 'column'
-      }}>
-        <div style={{ color: '#00ff41', fontFamily: 'monospace', fontSize: '1.5rem', letterSpacing: '5px' }}>
-          WARPING_TO_COORDINATES...
-        </div>
-        <div style={{ color: '#00ff41', opacity: 0.5, marginTop: '10px' }}>{diagnostics.lastAction}</div>
+      <div style={{ position: 'absolute', inset: 0, zIndex: 4000, backgroundColor: '#000', display: 'flex', justifyContent: 'center', alignItems: 'center', transition: 'opacity 0.4s', opacity: isWarping ? 1 : 0, pointerEvents: isWarping ? 'all' : 'none' }}>
+        <div style={{ color: '#00ff41', fontFamily: 'monospace', fontSize: '1.5rem', letterSpacing: '5px' }}>WARPING...</div>
       </div>
 
-      {/* כפתור Warp */}
-      {gameState === 'PLAYING' && (
-        <button 
-          disabled={isWarping}
-          onClick={handleChaosWarp}
-          style={warpButtonStyle}
-        >
-          [ CHAOS_WARP ]
-        </button>
+      {gameState !== 'START' && (
+        <>
+          <GuessMap 
+            onGuessSelected={setCurrentGuess} 
+            actualLocation={gameState === 'RESULT' ? actualLocation : null}
+            roundKey={roundKey}
+          />
+          
+          <div style={{ position: 'absolute', bottom: '30px', left: '20px', zIndex: 3500, display: 'flex', gap: '10px' }}>
+             {gameState === 'PLAYING' ? (
+               <button onClick={submitGuess} disabled={!currentGuess} style={actionButtonStyle(!!currentGuess)}>
+                 LOCK GUESS
+               </button>
+             ) : (
+               <button onClick={handleChaosWarp} style={actionButtonStyle(true)}>
+                 NEXT ROUND
+               </button>
+             )}
+          </div>
+        </>
       )}
 
-      {/* דיבאגר */}
-      <div style={debugPanelStyle}>
-        <div style={{ borderBottom: '1px solid #00ff41', marginBottom: '5px' }}>LOOTHUNT_V2 // STABLE</div>
-        <div>LOC: {diagnostics.locationName}</div>
-        <div>STATUS: {diagnostics.googleStatus}</div>
-      </div>
+      {gameState === 'RESULT' && distance !== null && (
+        <div style={{
+          position: 'absolute',
+          top: '50%',
+          left: '50%',
+          transform: 'translate(-50%, -50%)',
+          zIndex: 4500,
+          padding: '30px',
+          backgroundColor: 'rgba(0,0,0,0.85)',
+          border: '2px solid #00ff41',
+          borderRadius: '16px',
+          color: '#fff',
+          textAlign: 'center',
+          minWidth: '260px',
+          boxShadow: '0 0 30px rgba(0,255,65,0.25)'
+        }}>
+          <div style={{ fontSize: '1.2rem', marginBottom: '10px' }}>MISSION COMPLETE</div>
+          <div style={{ fontSize: '2.5rem', fontWeight: 'bold', color: '#00ff41' }}>
+            {distance < 1 ? `${(distance * 1000).toFixed(0)} meters` : `${distance.toFixed(1)} km`}
+          </div>
+          <div style={{ opacity: 0.6, marginTop: '5px' }}>Distance from Target</div>
+        </div>
+      )}
 
-      {/* דף נחיתה */}
       {gameState === 'START' && (
         <div style={landingStyle}>
-          <h1 style={titleStyle}>LOOTHUNT</h1>
+          <h1 style={titleStyle}>GEOBATTLE</h1>
           <button onClick={handleStartGame} style={buttonStyle}>INITIALIZE</button>
         </div>
       )}
@@ -176,32 +164,48 @@ export default function StreetView() {
   );
 }
 
-// --- סטיילים ---
-const debugPanelStyle: React.CSSProperties = {
-  position: 'absolute', top: 20, right: 20, zIndex: 3000,
-  width: '260px', backgroundColor: 'rgba(0,0,0,0.8)',
-  border: '1px solid #00ff41', padding: '12px',
-  fontFamily: 'monospace', fontSize: '11px', color: '#00ff41', pointerEvents: 'none'
-};
-
-const warpButtonStyle: React.CSSProperties = {
-  position: 'absolute', bottom: '40px', right: '40px', zIndex: 2500,
-  padding: '15px 35px', backgroundColor: 'rgba(0, 0, 0, 0.9)',
-  color: '#00ff41', border: '2px solid #00ff41', fontFamily: 'monospace',
-  cursor: 'pointer', fontSize: '1.1rem', letterSpacing: '3px'
-};
-
+// --- Styles ---
 const landingStyle: React.CSSProperties = {
-  position: 'absolute', inset: 0, zIndex: 1000,
-  display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center',
-  backgroundColor: '#000', fontFamily: 'monospace'
+  position: 'absolute',
+  inset: 0,
+  zIndex: 4500,
+  display: 'flex',
+  flexDirection: 'column',
+  justifyContent: 'center',
+  alignItems: 'center',
+  backgroundColor: 'rgba(0, 0, 0, 0.9)',
+  color: '#00ff41',
+  textAlign: 'center',
+  gap: '20px',
 };
+
+const actionButtonStyle = (active: boolean): React.CSSProperties => ({
+  padding: '15px 30px',
+  backgroundColor: '#000',
+  color: active ? '#00ff41' : '#444',
+  border: `2px solid ${active ? '#00ff41' : '#444'}`,
+  fontFamily: 'monospace',
+  cursor: active ? 'pointer' : 'not-allowed',
+  fontSize: '1rem',
+  letterSpacing: '2px',
+  boxShadow: active ? '0 0 20px rgba(0,255,65,0.35)' : 'none',
+  opacity: active ? 1 : 0.6,
+  transition: 'all 0.2s ease-in-out',
+});
 
 const titleStyle: React.CSSProperties = {
-  fontSize: '5rem', color: '#00ff41', letterSpacing: '20px', textShadow: '0 0 30px #00ff41'
+  fontSize: '4rem',
+  margin: 0,
+  letterSpacing: '0.25em',
 };
 
 const buttonStyle: React.CSSProperties = {
-  padding: '15px 60px', backgroundColor: 'transparent', color: '#00ff41',
-  border: '2px solid #00ff41', fontSize: '1.4rem', cursor: 'pointer', letterSpacing: '5px'
+  padding: '15px 35px',
+  border: '2px solid #00ff41',
+  backgroundColor: 'transparent',
+  color: '#00ff41',
+  fontFamily: 'monospace',
+  cursor: 'pointer',
+  fontSize: '1rem',
+  letterSpacing: '0.2em',
 };
