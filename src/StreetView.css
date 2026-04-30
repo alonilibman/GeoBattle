@@ -1,0 +1,183 @@
+/* StreetView.css */
+
+.app-container {
+  width: 100vw;
+  height: 100vh;
+  background-color: #000;
+  position: relative;
+  overflow: hidden;
+}
+
+.map-layer {
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  transition: opacity 0.6s ease;
+}
+
+.warp-screen {
+  position: absolute;
+  inset: 0;
+  z-index: 4000;
+  background-color: #000;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  transition: opacity 0.4s;
+}
+
+.warp-text {
+  color: #00ff41;
+  font-family: monospace;
+  font-size: 2rem;
+  letter-spacing: 8px;
+}
+
+.diagnostics-text {
+  color: #00ff41;
+  opacity: 0.6;
+  margin-top: 20px;
+  font-family: monospace;
+}
+
+.controls-container {
+  position: absolute;
+  bottom: 30px;
+  left: 20px;
+  z-index: 3500;
+  display: flex;
+  gap: 10px;
+}
+
+/* Menus */
+.landing-container, .menu-container {
+  position: absolute;
+  inset: 0;
+  z-index: 4500;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  color: #00ff41;
+}
+
+.landing-container {
+  background-color: rgba(0, 0, 0, 1);
+  gap: 20px;
+}
+
+.menu-container {
+  background-color: rgba(0, 0, 0, 0.95);
+  gap: 15px;
+}
+
+.title {
+  font-size: 4rem;
+  margin: 0;
+  letter-spacing: 0.25em;
+}
+
+.subtitle {
+  font-size: 2rem;
+  margin: 0 0 20px 0;
+  letter-spacing: 0.1em;
+  font-family: monospace;
+  color: #fff;
+  text-shadow: 0 0 10px #00ff41;
+}
+
+.terminal-input {
+  padding: 15px;
+  background-color: transparent;
+  border: 1px solid #00ff41;
+  color: #00ff41;
+  font-family: monospace;
+  font-size: 1.2rem;
+  width: 300px;
+  outline: none;
+}
+
+.terminal-input.centered {
+  text-align: center;
+  letter-spacing: 10px;
+  font-size: 2rem;
+}
+
+.base-btn {
+  padding: 15px 35px;
+  border: 2px solid #00ff41;
+  background-color: transparent;
+  color: #00ff41;
+  font-family: monospace;
+  cursor: pointer;
+  font-size: 1rem;
+  letter-spacing: 0.2em;
+  transition: all 0.2s;
+}
+
+.base-btn:hover {
+  background-color: rgba(0, 255, 65, 0.1);
+}
+
+.base-btn.secondary {
+  border-color: #444;
+  color: #888;
+  margin-top: 30px;
+}
+
+.action-btn {
+  padding: 15px 30px;
+  background-color: #000;
+  color: #00ff41;
+  border: 2px solid #00ff41;
+  font-family: monospace;
+  cursor: pointer;
+  font-size: 1rem;
+  letter-spacing: 2px;
+  box-shadow: 0 0 20px rgba(0,255,65,0.35);
+  transition: all 0.2s ease-in-out;
+  margin-top: 10px;
+}
+
+.action-btn:disabled, .action-btn.disabled {
+  color: #444;
+  border-color: #444;
+  cursor: not-allowed;
+  box-shadow: none;
+  opacity: 0.6;
+}
+
+.result-overlay {
+  position: absolute;
+  top: 20%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 4500;
+  padding: 30px 50px;
+  background-color: rgba(0,0,0,0.9);
+  border: 2px solid #00ff41;
+  border-radius: 8px;
+  color: #fff;
+  text-align: center;
+  min-width: 300px;
+  box-shadow: 0 0 40px rgba(0,255,65,0.4);
+  font-family: monospace;
+}
+
+.player-slot {
+  padding: 15px;
+  border: 1px solid #00ff41;
+  background-color: rgba(0,255,65,0.1);
+  text-align: left;
+  display: flex;
+  justify-content: space-between;
+}
+
+.empty-slot {
+  padding: 15px;
+  border: 1px dashed #444;
+  color: #444;
+  text-align: left;
+}
