@@ -4,22 +4,28 @@ import { importLibrary } from '@googlemaps/js-api-loader';
 interface GuessMapProps {
   onGuessSelected: (latLng: { lat: number, lng: number }) => void;
   actualLocation: { lat: number, lng: number } | null;
+  allGuesses?: any[]; // <--- NEW: Receives all multiplayer guesses
   roundKey: number;
 }
 
-export default function GuessMap({ onGuessSelected, actualLocation, roundKey }: GuessMapProps) {
+export default function GuessMap({ onGuessSelected, actualLocation, allGuesses, roundKey }: GuessMapProps) {
   const mapDivRef = useRef<HTMLDivElement>(null);
   const mapInstance = useRef<any>(null);
-  const guessMarkerRef = useRef<any>(null);
-  const actualMarkerRef = useRef<any>(null);
-  const polylineRef = useRef<any>(null);
-  const animFrameRef = useRef<number | null>(null); // שומר את האנימציה כדי שנוכל לעצור אותה
   
+  // Local active guess (during gameplay)
+  const localGuessMarkerRef = useRef<any>(null); 
+  
+  // End-of-round arrays (for multiplayer rendering)
+  const playerMarkersRef = useRef<any[]>([]);
+  const polylinesRef = useRef<any[]>([]);
+  const actualMarkerRef = useRef<any>(null);
+  
+  const animFrameRef = useRef<number | null>(null);
   const [mapSize, setMapSize] = useState<'S' | 'M' | 'L'>('S');
   const isPlayingRef = useRef(true);
   const resultShownRef = useRef(false);
 
-  // 1. אתחול ראשוני
+  // 1. Initial Setup
   useEffect(() => {
     const initMap = async () => {
       const { Map } = await importLibrary('maps') as any;
@@ -38,10 +44,10 @@ export default function GuessMap({ onGuessSelected, actualLocation, roundKey }: 
           const { Marker } = await importLibrary('marker') as any;
           const latLng = { lat: e.latLng.lat(), lng: e.latLng.lng() };
           
-          if (guessMarkerRef.current) {
-            guessMarkerRef.current.setPosition(latLng);
+          if (localGuessMarkerRef.current) {
+            localGuessMarkerRef.current.setPosition(latLng);
           } else {
-            guessMarkerRef.current = new Marker({
+            localGuessMarkerRef.current = new Marker({
               position: latLng,
               map: mapInstance.current,
             });
@@ -53,16 +59,21 @@ export default function GuessMap({ onGuessSelected, actualLocation, roundKey }: 
     initMap();
   }, [onGuessSelected]);
 
-  // 2. איפוס מוחלט בכל ראונד
+  // 2. Total Reset per round
   useEffect(() => {
-    if (guessMarkerRef.current) guessMarkerRef.current.setMap(null);
+    if (localGuessMarkerRef.current) localGuessMarkerRef.current.setMap(null);
     if (actualMarkerRef.current) actualMarkerRef.current.setMap(null);
-    if (polylineRef.current) polylineRef.current.setMap(null);
+    
+    // Clear all multiplayer markers and lines
+    playerMarkersRef.current.forEach(m => m.setMap(null));
+    polylinesRef.current.forEach(p => p.setMap(null));
+    playerMarkersRef.current = [];
+    polylinesRef.current = [];
+    
     if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     
-    guessMarkerRef.current = null;
+    localGuessMarkerRef.current = null;
     actualMarkerRef.current = null;
-    polylineRef.current = null;
     isPlayingRef.current = true;
     resultShownRef.current = false;
     
@@ -74,30 +85,77 @@ export default function GuessMap({ onGuessSelected, actualLocation, roundKey }: 
     }
   }, [roundKey]);
 
-  // 3. תצוגת תוצאות сиנמטית (Zoom + אנימציית חץ)
+  // 3. Cinematic Results (Multiplayer Support)
   useEffect(() => {
     const showResultSequence = async () => {
-      if (actualLocation && guessMarkerRef.current && mapInstance.current && !resultShownRef.current) {
+      if (actualLocation && mapInstance.current && !resultShownRef.current) {
         resultShownRef.current = true;
         isPlayingRef.current = false;
         
         const googleNamespace = (window as any).google;
-        const guessPos = guessMarkerRef.current.getPosition();
         
-        // מגדיל את המפה דרך CSS
+        // Hide the local active guess marker so we can draw the official labeled ones
+        if (localGuessMarkerRef.current) {
+            localGuessMarkerRef.current.setMap(null);
+        }
+        
         setMapSize('L'); 
 
-        // ממתין שההגדלה תסתיים, ואז מתחיל את האקשן של גוגל מפות
         setTimeout(() => {
           if (!mapInstance.current) return;
 
-          // מבצע Zoom-in/Out חכם שרואה את שתי הנקודות
           const bounds = new googleNamespace.maps.LatLngBounds();
-          bounds.extend(guessPos);
           bounds.extend(actualLocation);
-          mapInstance.current.fitBounds(bounds, { padding: 80 });
 
-          // זורק את הסיכה האמיתית
+          // Determine if we are plotting a single player or an entire lobby
+          let playersToPlot = [];
+          if (allGuesses && allGuesses.length > 0) {
+              playersToPlot = allGuesses;
+          } else if (localGuessMarkerRef.current) {
+              // Fallback for single player if allGuesses isn't passed
+              playersToPlot = [{ name: 'YOU', currentGuess: localGuessMarkerRef.current.getPosition() }];
+          }
+
+          const lineSymbol = {
+            path: googleNamespace.maps.SymbolPath.FORWARD_CLOSED_ARROW,
+            scale: 4,
+            strokeColor: '#00ff41'
+          };
+
+          // Loop through every player and draw their marker and line
+          playersToPlot.forEach((player) => {
+              if (!player.currentGuess) return; // Skip players who didn't guess in time
+              
+              const pos = player.currentGuess;
+              bounds.extend(pos);
+
+              // Create Player Marker
+              const pMarker = new googleNamespace.maps.Marker({
+                  position: pos,
+                  map: mapInstance.current,
+                  label: {
+                      text: player.name.substring(0, 2).toUpperCase(),
+                      color: "#000",
+                      fontWeight: "bold"
+                  },
+                  title: player.name,
+              });
+              playerMarkersRef.current.push(pMarker);
+
+              // Create Line to Destination
+              const pLine = new googleNamespace.maps.Polyline({
+                path: [pos, actualLocation],
+                geodesic: true,
+                strokeColor: '#ff4141',
+                strokeOpacity: 0.5,
+                strokeWeight: 2,
+                icons: [{ icon: lineSymbol, offset: '0%' }],
+                map: mapInstance.current
+              });
+              polylinesRef.current.push(pLine);
+          });
+
+          // Drop the Actual Location Marker
           actualMarkerRef.current = new googleNamespace.maps.Marker({
             position: actualLocation,
             map: mapInstance.current,
@@ -105,41 +163,29 @@ export default function GuessMap({ onGuessSelected, actualLocation, roundKey }: 
             animation: googleNamespace.maps.Animation.DROP
           });
 
-          // מצייר קו עם חץ מונפש
-          const lineSymbol = {
-            path: googleNamespace.maps.SymbolPath.FORWARD_CLOSED_ARROW,
-            scale: 4,
-            strokeColor: '#00ff41'
-          };
+          // Smart Zoom to fit everyone
+          mapInstance.current.fitBounds(bounds, { padding: 80 });
 
-          polylineRef.current = new googleNamespace.maps.Polyline({
-            path: [guessPos, actualLocation],
-            geodesic: true,
-            strokeColor: '#ff4141',
-            strokeOpacity: 0.5,
-            strokeWeight: 2,
-            icons: [{ icon: lineSymbol, offset: '0%' }],
-            map: mapInstance.current
-          });
-
-          // פונקציית אנימציה שרצה בלופ ומזיזה את החץ על הקו
+          // Animate ALL arrows simultaneously
           let count = 0;
-          const animateArrow = () => {
+          const animateArrows = () => {
             count = (count + 1) % 200;
-            const icons = polylineRef.current.get('icons');
-            if (icons && icons[0]) {
-              icons[0].offset = (count / 2) + '%';
-              polylineRef.current.set('icons', icons);
-            }
-            animFrameRef.current = requestAnimationFrame(animateArrow);
+            polylinesRef.current.forEach(line => {
+                const icons = line.get('icons');
+                if (icons && icons[0]) {
+                  icons[0].offset = (count / 2) + '%';
+                  line.set('icons', icons);
+                }
+            });
+            animFrameRef.current = requestAnimationFrame(animateArrows);
           };
-          animateArrow();
+          animateArrows();
 
-        }, 450); // ממתין חצי שנייה להתייצבות הגודל
+        }, 450); 
       }
     };
     showResultSequence();
-  }, [actualLocation]);
+  }, [actualLocation, allGuesses]);
 
   const toggleSize = () => {
     setMapSize(prev => prev === 'S' ? 'M' : prev === 'M' ? 'L' : 'S');
@@ -147,9 +193,9 @@ export default function GuessMap({ onGuessSelected, actualLocation, roundKey }: 
 
   const getDynamicDimensions = () => {
     switch (mapSize) {
-      case 'L': return { width: '85vw', height: '75vh' };
-      case 'M': return { width: '600px', height: '400px' };
-      case 'S': default:  return { width: '320px', height: '220px' };
+      case 'L': return { width: '85vw', height: '75vh', bottom: '10vh', left: '7.5vw' };
+      case 'M': return { width: '600px', height: '400px', bottom: '100px', left: '20px' };
+      case 'S': default:  return { width: '320px', height: '220px', bottom: '100px', left: '20px' };
     }
   };
 
@@ -167,10 +213,10 @@ export default function GuessMap({ onGuessSelected, actualLocation, roundKey }: 
 
 // --- Styles ---
 const baseContainerStyle: React.CSSProperties = {
-  position: 'absolute', bottom: '100px', left: '20px', zIndex: 3000,
+  position: 'absolute', zIndex: 3000,
   border: '2px solid #00ff41', borderRadius: '4px', overflow: 'hidden',
   boxShadow: '0 0 30px rgba(0,0,0,0.8)', backgroundColor: '#000',
-  transition: 'width 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275), height 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275)'
+  transition: 'all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275)'
 };
 
 const resizeButtonStyle: React.CSSProperties = {
