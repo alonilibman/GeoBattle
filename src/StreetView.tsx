@@ -1,26 +1,15 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { importLibrary, setOptions } from '@googlemaps/js-api-loader';
 import { doc, setDoc, getDoc, updateDoc, onSnapshot } from 'firebase/firestore';
-import { db } from './firebase'; 
+import { db } from './firebase'; // <-- Import your Firestore setup
 import GuessMap from './GuessMap';
-import './StreetView.css'; 
 
 const API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
 if (API_KEY) {
   setOptions({ key: API_KEY, v: 'weekly' });
 }
 
-type GameState = 'START' | 'MP_MENU' | 'CREATE_LOBBY' | 'JOIN_LOBBY' | 'LOBBY' | 'PLAYING' | 'ROUND_OVER' | 'GAME_OVER';
-
-interface Player {
-  id: string;
-  name: string;
-  isHost: boolean;
-  score: number;
-  currentGuess: { lat: number, lng: number } | null;
-  distance: number | null;
-  pointsEarned: number | null;
-}
+type GameState = 'START' | 'MP_MENU' | 'CREATE_LOBBY' | 'JOIN_LOBBY' | 'LOBBY' | 'PLAYING' | 'RESULT';
 
 export default function StreetView() {
   const mapRef = useRef<HTMLDivElement>(null);
@@ -33,28 +22,19 @@ export default function StreetView() {
   
   const [currentGuess, setCurrentGuess] = useState<{lat: number, lng: number} | null>(null);
   const [actualLocation, setActualLocation] = useState<{lat: number, lng: number} | null>(null);
+  const [distance, setDistance] = useState<number | null>(null);
+  const [points, setPoints] = useState<number | null>(null);
   const [roundKey, setRoundKey] = useState(0);
 
-  // Multiplayer & Lobby States
+  // Multiplayer States
   const [playerName, setPlayerName] = useState('');
-  const [playerId] = useState(() => Math.random().toString(36).substring(2, 9));
-  const [lobbyCode, setLobbyCode] = useState('')
+  const [playerId] = useState(() => Math.random().toString(36).substring(2, 9)); // Generate random local ID
+  const [lobbyCode, setLobbyCode] = useState('');
   const [joinCodeInput, setJoinCodeInput] = useState('');
   const [isHost, setIsHost] = useState(false);
-  const [lobbyData, setLobbyData] = useState<any>(null);
-  
-  // Settings for Host Creation
-  const [settings, setSettings] = useState({
-    roundTime: 60,
-    timeAfterFirstGuess: 15,
-    maxRounds: 5,
-    pointsToWin: 0,
-    elimination: false
-  });
+  const [players, setPlayers] = useState<{id: string, name: string, isHost: boolean}[]>([]);
 
-  const [timeLeft, setTimeLeft] = useState<number | null>(null);
-
-  // Initialize Maps (Fixing Phone Motion Tracking)
+  // Silent Init Google Maps
   useEffect(() => {
     let isMounted = true;
     const init = async () => {
@@ -70,8 +50,6 @@ export default function StreetView() {
             source: 'outdoor' as any,
             addressControl: false,
             showRoadLabels: false,
-            motionTracking: false,        // FIX 1: Disable phone tilt movement
-            motionTrackingControl: false  // FIX 1: Remove the compass tilt button
           });
         }
       } catch (err) { console.error(err); }
@@ -80,73 +58,52 @@ export default function StreetView() {
     return () => { isMounted = false; };
   }, []);
 
-  // --- MULTIPLAYER REAL-TIME SYNC ---
+  // --- MULTIPLAYER REAL-TIME LISTENER ---
   useEffect(() => {
     if (!lobbyCode) return;
     
+    // This listens to the specific lobby document in Firestore
     const unsub = onSnapshot(doc(db, 'lobbies', lobbyCode), (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
-        setLobbyData(data);
+        setPlayers(data.players || []);
         
-        // Host has started the game/round
-        if (data.status === 'PLAYING' && data.targetLocation && gameState !== 'PLAYING') {
-           if (!isHost) executeWarp(data.targetLocation);
-           setCurrentGuess(null);
-        }
-
-        // Host has ended the round
-        if (data.status === 'ROUND_OVER' && gameState !== 'ROUND_OVER') {
-          setGameState('ROUND_OVER');
-          setActualLocation(data.targetLocation);
-        }
-
-        // Host has ended the game
-        if (data.status === 'GAME_OVER' && gameState !== 'GAME_OVER') {
-          setGameState('GAME_OVER');
+        // If the host changed the state to playing and provided coordinates, warp the clients!
+        if (data.status === 'PLAYING' && data.targetLocation && !isHost && gameState === 'LOBBY') {
+           executeWarp(data.targetLocation);
         }
       }
     });
 
-    return () => unsub();
+    return () => unsub(); // Cleanup listener on unmount
   }, [lobbyCode, isHost, gameState]);
 
-  // --- TIMER LOGIC ---
-  useEffect(() => {
-    if (gameState === 'PLAYING' && lobbyData?.roundEndTime) {
-      const interval = setInterval(() => {
-        const remaining = Math.max(0, Math.floor((lobbyData.roundEndTime - Date.now()) / 1000));
-        setTimeLeft(remaining);
-
-        // Host handles Auto-Ending the round when time is up
-        if (remaining <= 0 && isHost) {
-          endRound(lobbyData);
-        }
-      }, 500);
-      return () => clearInterval(interval);
-    } else {
-      setTimeLeft(null);
-    }
-  }, [gameState, lobbyData, isHost]);
-
+  // Execute warp to a specific coordinate (used by non-hosts to follow the host)
   const executeWarp = (pos: {lat: number, lng: number}) => {
     setIsWarping(true);
     setGameState('PLAYING');
+    setCurrentGuess(null);
+    setDistance(null);
+    setPoints(null);
     setRoundKey(prev => prev + 1);
     
     panoInstance.current.setPosition(pos);
+    setActualLocation(pos);
     panoInstance.current.setPov({ heading: Math.random() * 360, pitch: 0 });
     setDiagnostics({ status: 'TARGET LOCKED.' });
     
     setTimeout(() => setIsWarping(false), 800);
   };
 
+  // Host finding a random location
   const handleChaosWarp = async () => {
     if (!googleServiceRef.current || !panoInstance.current) return;
     
     setIsWarping(true);
     setGameState('PLAYING');
     setCurrentGuess(null);
+    setDistance(null);
+    setPoints(null);
     setRoundKey(prev => prev + 1);
     setDiagnostics({ status: 'SEARCHING SIGNAL...' });
 
@@ -160,7 +117,7 @@ export default function StreetView() {
       try {
         const response = await googleServiceRef.current.getPanorama({
           location: { lat, lng },
-          radius: 50000,
+          radius: 100000,
           source: 'outdoor' as any
         });
         
@@ -168,27 +125,20 @@ export default function StreetView() {
           const copyright = response.data.copyright || '';
           const links = response.data.links || [];
           
-          if (!copyright.includes('Google') || links.length === 0) {
-            await new Promise(resolve => setTimeout(resolve, 250));
-            continue;
-          }
+          if (!copyright.includes('Google') || links.length === 0) continue;
 
           const pos = { lat: response.data.location.latLng.lat(), lng: response.data.location.latLng.lng() };
           
+          // Warp the host locally
           panoInstance.current.setPosition(pos);
           setActualLocation(pos);
           panoInstance.current.setPov({ heading: Math.random() * 360, pitch: 0 });
           
-          if (lobbyCode && isHost && lobbyData) {
-            // Reset players' guesses for the new round
-            const resetPlayers = lobbyData.players.map((p: Player) => ({ ...p, currentGuess: null, distance: null, pointsEarned: null }));
-            
+          // If in a lobby, tell Firestore to warp everyone else!
+          if (lobbyCode && isHost) {
             await updateDoc(doc(db, 'lobbies', lobbyCode), {
               status: 'PLAYING',
-              targetLocation: pos,
-              roundEndTime: Date.now() + (lobbyData.settings.roundTime * 1000),
-              currentRound: (lobbyData.currentRound || 0) + 1,
-              players: resetPlayers
+              targetLocation: pos
             });
           }
 
@@ -196,98 +146,24 @@ export default function StreetView() {
           setDiagnostics({ status: 'TARGET LOCKED.' });
           setTimeout(() => setIsWarping(false), 800);
         }
-      } catch (e) { 
-        await new Promise(resolve => setTimeout(resolve, 250)); 
-      }
+      } catch (e) { /* Retry */ }
     }
     if (!found) setDiagnostics({ status: 'WARP FAILED. TRY AGAIN.' });
   };
 
-  const calculateDistance = (p1: {lat: number, lng: number}, p2: {lat: number, lng: number}) => {
-    const R = 6371; 
-    const dLat = (p2.lat - p1.lat) * Math.PI / 180;
-    const dLng = (p2.lng - p1.lng) * Math.PI / 180;
-    const a = Math.sin(dLat/2) * Math.sin(dLat/2) + Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180) * Math.sin(dLng/2) * Math.sin(dLng/2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-    return R * c;
-  };
+  // --- LOBBY ACTIONS ---
 
-  const submitGuess = async () => {
-    if (!currentGuess || !lobbyData || gameState !== 'PLAYING') return;
-
-    const updatedPlayers = lobbyData.players.map((p: Player) => 
-      p.id === playerId ? { ...p, currentGuess } : p
-    );
-
-    let newEndTime = lobbyData.roundEndTime;
-    const guessesCount = updatedPlayers.filter((p: Player) => p.currentGuess).length;
-
-    // Fast-Forward timer if someone guesses and it's the first guess
-    if (guessesCount === 1) {
-      const potentialNewEnd = Date.now() + (lobbyData.settings.timeAfterFirstGuess * 1000);
-      if (potentialNewEnd < newEndTime) {
-        newEndTime = potentialNewEnd;
-      }
-    }
-
-    await updateDoc(doc(db, 'lobbies', lobbyCode), {
-      players: updatedPlayers,
-      roundEndTime: newEndTime
-    });
-
-    // If everyone guessed, host ends round immediately
-    if (isHost && guessesCount === lobbyData.players.length) {
-      endRound({ ...lobbyData, players: updatedPlayers });
-    }
-  };
-
-  const endRound = async (currentLobbyData: any) => {
-    if (!isHost) return;
-
-    // Calculate scores for everyone
-    const scoredPlayers = currentLobbyData.players.map((p: Player) => {
-      let points = 0;
-      let dist = null;
-      if (p.currentGuess && currentLobbyData.targetLocation) {
-        dist = calculateDistance(p.currentGuess, currentLobbyData.targetLocation);
-        points = Math.max(0, Math.round(5000 * Math.exp(-dist / 2000)));
-      }
-      return { ...p, distance: dist, pointsEarned: points, score: (p.score || 0) + points };
-    });
-
-    // Check Win/Game Over conditions
-    const isMaxRoundsHit = currentLobbyData.currentRound >= currentLobbyData.settings.maxRounds;
-    const hasPointWinner = currentLobbyData.settings.pointsToWin > 0 && scoredPlayers.some((p:Player) => p.score >= currentLobbyData.settings.pointsToWin);
-    
-    // Sort by score
-    scoredPlayers.sort((a:Player, b:Player) => b.score - a.score);
-
-    // Apply Elimination logic
-    let finalPlayers = scoredPlayers;
-    if (currentLobbyData.settings.elimination && scoredPlayers.length > 1) {
-       // Optional: Remove lowest score player logic can go here. For now just marking.
-       finalPlayers[finalPlayers.length - 1].name += " (AT RISK)";
-    }
-
-    await updateDoc(doc(db, 'lobbies', lobbyCode), {
-      status: (isMaxRoundsHit || hasPointWinner) ? 'GAME_OVER' : 'ROUND_OVER',
-      players: finalPlayers
-    });
-  };
-
-  // --- LOBBY CREATION & JOINING ---
   const handleCreateLobby = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!playerName.trim()) return;
     
     const newCode = Math.floor(10000 + Math.random() * 90000).toString();
-    const newPlayer: Player = { id: playerId, name: playerName, isHost: true, score: 0, currentGuess: null, distance: null, pointsEarned: null };
+    const newPlayer = { id: playerId, name: playerName, isHost: true };
     
+    // Create new lobby in Firestore
     await setDoc(doc(db, 'lobbies', newCode), {
       status: 'LOBBY',
       targetLocation: null,
-      settings: settings,
-      currentRound: 0,
       players: [newPlayer]
     });
 
@@ -304,13 +180,19 @@ export default function StreetView() {
     const lobbySnap = await getDoc(lobbyRef);
 
     if (lobbySnap.exists()) {
-      const data = lobbySnap.data();
-      if (data.players.length >= 8) return alert("Lobby is full!");
-      if (data.status !== 'LOBBY') return alert("Game already in progress!");
+      const lobbyData = lobbySnap.data();
+      if (lobbyData.players.length >= 8) {
+        alert("Lobby is full!");
+        return;
+      }
       
-      const newPlayer: Player = { id: playerId, name: playerName, isHost: false, score: 0, currentGuess: null, distance: null, pointsEarned: null };
+      const newPlayer = { id: playerId, name: playerName, isHost: false };
       
-      await updateDoc(lobbyRef, { players: [...data.players, newPlayer] });
+      // Update Firestore with new player
+      await updateDoc(lobbyRef, {
+        players: [...lobbyData.players, newPlayer]
+      });
+
       setLobbyCode(joinCodeInput);
       setIsHost(false);
       setGameState('LOBBY');
@@ -319,132 +201,181 @@ export default function StreetView() {
     }
   };
 
-  // --- RENDERERS ---
-  const renderCreateLobby = () => (
-    <form onSubmit={handleCreateLobby} className="menu-container">
-      <h2 className="subtitle">INITIALIZE LOBBY</h2>
-      <input autoFocus placeholder="ENTER CALLSIGN" value={playerName} onChange={(e) => setPlayerName(e.target.value)} className="terminal-input" maxLength={15} style={{marginBottom: '20px'}}/>
-      
-      <div className="settings-grid">
-        <label className="settings-label">ROUND TIME (SEC)
-          <input type="number" value={settings.roundTime} onChange={e => setSettings({...settings, roundTime: Number(e.target.value)})} className="terminal-input" min="10" max="300" />
-        </label>
-        <label className="settings-label">TIME AFTER 1ST GUESS (SEC)
-          <input type="number" value={settings.timeAfterFirstGuess} onChange={e => setSettings({...settings, timeAfterFirstGuess: Number(e.target.value)})} className="terminal-input" min="5" max="60" />
-        </label>
-        <label className="settings-label">MAX ROUNDS
-          <input type="number" value={settings.maxRounds} onChange={e => setSettings({...settings, maxRounds: Number(e.target.value)})} className="terminal-input" min="1" max="10" />
-        </label>
-        <label className="settings-label">POINTS TO WIN (0 = Disable)
-          <input type="number" value={settings.pointsToWin} onChange={e => setSettings({...settings, pointsToWin: Number(e.target.value)})} className="terminal-input" min="0" />
-        </label>
-        <label className="settings-label">ELIMINATION MODE
-          <select value={settings.elimination ? 'YES' : 'NO'} onChange={e => setSettings({...settings, elimination: e.target.value === 'YES'})} className="terminal-select">
-            <option value="NO">NO</option>
-            <option value="YES">YES</option>
-          </select>
-        </label>
-      </div>
+  // ... (Distance and submit guess logic remains the same)
+  const calculateDistance = (p1: any, p2: any) => {
+    const R = 6371; 
+    const dLat = (p2.lat - p1.lat) * Math.PI / 180;
+    const dLng = (p2.lng - p1.lng) * Math.PI / 180;
+    const a = Math.sin(dLat/2) * Math.sin(dLat/2) + Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180) * Math.sin(dLng/2) * Math.sin(dLng/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c;
+  };
 
-      <button type="submit" disabled={!playerName} className="action-btn">GENERATE CODE</button>
-      <button type="button" onClick={() => setGameState('MP_MENU')} className="base-btn" style={{border: 'none', marginTop: '10px'}}>BACK</button>
+  const submitGuess = useCallback(() => {
+    if (!currentGuess || !actualLocation || gameState !== 'PLAYING') return;
+    const dist = calculateDistance(currentGuess, actualLocation);
+    const calculatedPoints = Math.max(0, Math.round(5000 * Math.exp(-dist / 2000)));
+    
+    setDistance(dist);
+    setPoints(calculatedPoints);
+    setGameState('RESULT');
+  }, [currentGuess, actualLocation, gameState]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.code === 'Space' && currentGuess && gameState === 'PLAYING') {
+        e.preventDefault();
+        submitGuess();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [currentGuess, gameState, submitGuess]);
+
+
+  // --- RENDERING ---
+  const renderMultiplayerMenu = () => (
+    <div style={menuContainerStyle}>
+      <h2 style={subtitleStyle}>MULTIPLAYER UPLINK</h2>
+      <div style={{ display: 'flex', gap: '20px', marginTop: '20px' }}>
+        <button onClick={() => setGameState('CREATE_LOBBY')} style={buttonStyle}>CREATE LOBBY</button>
+        <button onClick={() => setGameState('JOIN_LOBBY')} style={buttonStyle}>JOIN LOBBY</button>
+      </div>
+      <button onClick={() => setGameState('START')} style={{ ...buttonStyle, marginTop: '30px', borderColor: '#444', color: '#888' }}>ABORT</button>
+    </div>
+  );
+
+  const renderCreateLobby = () => (
+    <form onSubmit={handleCreateLobby} style={menuContainerStyle}>
+      <h2 style={subtitleStyle}>INITIALIZE LOBBY</h2>
+      <input 
+        autoFocus placeholder="ENTER CALLSIGN (NICKNAME)" value={playerName} 
+        onChange={(e) => setPlayerName(e.target.value)} style={inputStyle} maxLength={15}
+      />
+      <button type="submit" disabled={!playerName} style={actionButtonStyle(!!playerName)}>GENERATE CODE</button>
+      <button type="button" onClick={() => setGameState('MP_MENU')} style={{ ...buttonStyle, marginTop: '20px', border: 'none' }}>BACK</button>
     </form>
   );
 
-  return (
-    <div className="app-container">
-      <div ref={mapRef} className="map-layer" style={{ opacity: (['START', 'MP_MENU', 'CREATE_LOBBY', 'JOIN_LOBBY', 'LOBBY', 'ROUND_OVER', 'GAME_OVER'].includes(gameState) || isWarping) ? 0 : 1 }} />
+  const renderJoinLobby = () => (
+    <form onSubmit={handleJoinLobby} style={menuContainerStyle}>
+      <h2 style={subtitleStyle}>JOIN UPLINK</h2>
+      <input 
+        autoFocus placeholder="ENTER 5-DIGIT CODE" value={joinCodeInput} 
+        onChange={(e) => setJoinCodeInput(e.target.value.replace(/\D/g, '').slice(0, 5))} 
+        style={{ ...inputStyle, textAlign: 'center', letterSpacing: '10px', fontSize: '2rem' }} 
+      />
+      <input 
+        placeholder="ENTER CALLSIGN (NICKNAME)" value={playerName} 
+        onChange={(e) => setPlayerName(e.target.value)} style={inputStyle} maxLength={15}
+      />
+      <button type="submit" disabled={!playerName || joinCodeInput.length !== 5} style={actionButtonStyle(!!playerName && joinCodeInput.length === 5)}>CONNECT</button>
+      <button type="button" onClick={() => setGameState('MP_MENU')} style={{ ...buttonStyle, marginTop: '20px', border: 'none' }}>BACK</button>
+    </form>
+  );
 
-      <div className="warp-screen" style={{ opacity: isWarping ? 1 : 0, pointerEvents: isWarping ? 'all' : 'none' }}>
-        <div className="warp-text">WARPING...</div>
-        <div className="diagnostics-text">{diagnostics.status}</div>
+  const renderLobbyRoom = () => (
+    <div style={menuContainerStyle}>
+      <h2 style={subtitleStyle}>LOBBY: {lobbyCode}</h2>
+      <div style={{ color: '#00ff41', opacity: 0.7, marginBottom: '20px' }}>PLAYERS ({players.length}/8)</div>
+      
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px', width: '100%', maxWidth: '600px', marginBottom: '30px' }}>
+        {players.map((p) => (
+          <div key={p.id} style={{ padding: '15px', border: '1px solid #00ff41', backgroundColor: 'rgba(0,255,65,0.1)', textAlign: 'left', display: 'flex', justifyContent: 'space-between' }}>
+            <span>{p.name}</span>
+            {p.isHost && <span style={{ fontSize: '0.8rem', opacity: 0.7 }}>[HOST]</span>}
+          </div>
+        ))}
+        {Array.from({ length: 8 - players.length }).map((_, i) => (
+           <div key={`empty-${i}`} style={{ padding: '15px', border: '1px dashed #444', color: '#444', textAlign: 'left' }}>[ EMPTY SLOT ]</div>
+        ))}
       </div>
 
-      {/* HUD (Timer & Players) */}
-      {gameState === 'PLAYING' && (
-        <div className="hud-container">
-           {timeLeft !== null && (
-             <div className={`timer ${timeLeft <= 15 ? 'warning' : ''}`}>
-               00:{timeLeft.toString().padStart(2, '0')}
-             </div>
-           )}
-           <div className="player-status-list">
-             {lobbyData?.players.map((p: Player) => (
-               <div key={p.id} style={{ color: p.currentGuess ? '#00ff41' : '#fff' }}>
-                 {p.currentGuess ? '✅ ' : '⏳ '}{p.name}
-               </div>
-             ))}
-           </div>
-        </div>
+      {isHost ? (
+        <button onClick={handleChaosWarp} style={actionButtonStyle(true)}>INITIATE WARP (START)</button>
+      ) : (
+        <div style={{ padding: '15px', color: '#888', border: '1px solid #444' }}>WAITING FOR HOST TO INITIATE...</div>
       )}
+      
+      <button onClick={() => { setGameState('START'); setLobbyCode(''); }} style={{ ...buttonStyle, marginTop: '30px', borderColor: '#444', color: '#888' }}>LEAVE LOBBY</button>
+    </div>
+  );
 
-      {(gameState === 'PLAYING' || gameState === 'ROUND_OVER' || gameState === 'GAME_OVER') && (
+  return (
+    <div style={{ width: '100vw', height: '100vh', backgroundColor: '#000', position: 'relative', overflow: 'hidden' }}>
+      
+      <div 
+        ref={mapRef} 
+        style={{ 
+          width: '100%', height: '100%', position: 'absolute',
+          opacity: (['START', 'MP_MENU', 'CREATE_LOBBY', 'JOIN_LOBBY', 'LOBBY'].includes(gameState) || isWarping) ? 0 : 1,
+          transition: 'opacity 0.6s ease'
+        }} 
+      />
+
+      <div style={{ 
+        position: 'absolute', inset: 0, zIndex: 4000, backgroundColor: '#000', 
+        display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', 
+        transition: 'opacity 0.4s', opacity: isWarping ? 1 : 0, pointerEvents: isWarping ? 'all' : 'none' 
+      }}>
+        <div style={{ color: '#00ff41', fontFamily: 'monospace', fontSize: '2rem', letterSpacing: '8px' }}>WARPING...</div>
+        <div style={{ color: '#00ff41', opacity: 0.6, marginTop: '20px', fontFamily: 'monospace' }}>{diagnostics.status}</div>
+      </div>
+
+      {(gameState === 'PLAYING' || gameState === 'RESULT') && (
         <>
-          {/* NOTICE: We pass ALL guesses to GuessMap so it can draw them in post-round! */}
-          <GuessMap 
-            onGuessSelected={setCurrentGuess} 
-            actualLocation={gameState === 'ROUND_OVER' || gameState === 'GAME_OVER' ? actualLocation : null} 
-            allGuesses={gameState === 'ROUND_OVER' || gameState === 'GAME_OVER' ? lobbyData?.players : []}
-            roundKey={roundKey} 
-          />
+          <GuessMap onGuessSelected={setCurrentGuess} actualLocation={gameState === 'RESULT' ? actualLocation : null} roundKey={roundKey} />
+          <div style={{ position: 'absolute', bottom: '30px', left: '20px', zIndex: 3500, display: 'flex', gap: '10px' }}>
+             {gameState === 'PLAYING' ? (
+               <button onClick={submitGuess} disabled={!currentGuess} style={actionButtonStyle(!!currentGuess)}>LOCK GUESS [SPACE]</button>
+             ) : (
+               isHost || !lobbyCode ? (
+                 <button onClick={handleChaosWarp} style={actionButtonStyle(true)}>NEXT ROUND</button>
+               ) : (
+                 <div style={{...actionButtonStyle(false), backgroundColor: 'rgba(0,0,0,0.8)'}}>WAITING FOR HOST</div>
+               )
+             )}
+          </div>
         </>
       )}
 
-      {(gameState === 'PLAYING') && (
-        <div className="controls-container">
-          <button onClick={submitGuess} disabled={!currentGuess || lobbyData?.players.find((p:Player)=>p.id===playerId)?.currentGuess} className="action-btn">
-             {lobbyData?.players.find((p:Player)=>p.id===playerId)?.currentGuess ? 'LOCKED IN' : 'LOCK GUESS'}
-          </button>
-        </div>
-      )}
-
-      {/* LEADERBOARD / ROUND SUMMARY */}
-      {(gameState === 'ROUND_OVER' || gameState === 'GAME_OVER') && lobbyData && (
-        <div className="result-overlay">
-          <h2 style={{ color: gameState === 'GAME_OVER' ? '#ffd700' : '#00ff41' }}>
-            {gameState === 'GAME_OVER' ? 'GAME COMPLETE' : `ROUND ${lobbyData.currentRound} COMPLETE`}
-          </h2>
-          
-          <div style={{ textAlign: 'left', marginTop: '20px' }}>
-            {lobbyData.players.map((p: Player, i: number) => (
-              <div key={p.id} className="player-score-row">
-                <span style={{ fontWeight: 'bold' }}>{i + 1}. {p.name}</span>
-                <span style={{ color: '#aaa' }}>
-                  +{p.pointsEarned || 0} pts 
-                  ({p.distance !== null ? (p.distance < 1 ? `${(p.distance * 1000).toFixed(0)}m` : `${p.distance.toFixed(1)}km`) : 'No Guess'})
-                </span>
-                <span style={{ color: '#00ff41', fontWeight: 'bold', marginLeft: '10px' }}>TOTAL: {p.score}</span>
-              </div>
-            ))}
+      {gameState === 'RESULT' && distance !== null && points !== null && (
+        <div style={resultOverlayStyle}>
+          <div style={{ fontSize: '1.2rem', marginBottom: '15px', borderBottom: '1px solid #00ff41', paddingBottom: '5px' }}>MISSION COMPLETE</div>
+          <div style={{ fontSize: '3rem', fontWeight: 'bold', color: '#fff', textShadow: '0 0 20px #00ff41' }}>
+            {points} <span style={{ fontSize: '1.5rem', opacity: 0.7 }}>PTS</span>
           </div>
-
-          <div style={{ marginTop: '30px' }}>
-            {isHost ? (
-               gameState === 'GAME_OVER' ? (
-                 <button onClick={() => setGameState('START')} className="action-btn">RETURN TO MENU</button>
-               ) : (
-                 <button onClick={handleChaosWarp} className="action-btn">INITIATE NEXT WARP</button>
-               )
-            ) : (
-               <div style={{ color: '#888' }}>WAITING FOR HOST...</div>
-            )}
+          <div style={{ fontSize: '1.5rem', color: '#00ff41', marginTop: '10px' }}>
+            {distance < 1 ? `${(distance * 1000).toFixed(0)} meters away` : `${distance.toFixed(1)} km away`}
           </div>
         </div>
       )}
 
-      {/* ... (START, MP_MENU, JOIN_LOBBY, LOBBY renderers stay exactly the same as before, just referencing the new classes) ... */}
-      
       {gameState === 'START' && (
-        <div className="landing-container">
-          <h1 className="title">GEOBATTLE</h1>
-          <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', justifyContent: 'center' }}>
-            <button onClick={handleChaosWarp} className="base-btn">SINGLE PLAYER</button>
-            <button onClick={() => setGameState('MP_MENU')} className="base-btn">MULTI PLAYER</button>
+        <div style={landingStyle}>
+          <h1 style={titleStyle}>GEOBATTLE</h1>
+          <div style={{ display: 'flex', gap: '20px', marginTop: '20px' }}>
+            <button onClick={handleChaosWarp} style={buttonStyle}>SINGLE PLAYER</button>
+            <button onClick={() => setGameState('MP_MENU')} style={buttonStyle}>MULTI PLAYER</button>
           </div>
         </div>
       )}
-      
+
+      {gameState === 'MP_MENU' && renderMultiplayerMenu()}
       {gameState === 'CREATE_LOBBY' && renderCreateLobby()}
+      {gameState === 'JOIN_LOBBY' && renderJoinLobby()}
+      {gameState === 'LOBBY' && renderLobbyRoom()}
+      
     </div>
   );
 }
+
+// --- Styles ---
+const landingStyle: React.CSSProperties = { position: 'absolute', inset: 0, zIndex: 4500, display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0, 0, 0, 1)', color: '#00ff41', textAlign: 'center', gap: '20px' };
+const menuContainerStyle: React.CSSProperties = { ...landingStyle, gap: '15px', backgroundColor: 'rgba(0,0,0,0.95)' };
+const titleStyle: React.CSSProperties = { fontSize: '4rem', margin: 0, letterSpacing: '0.25em' };
+const subtitleStyle: React.CSSProperties = { fontSize: '2rem', margin: '0 0 20px 0', letterSpacing: '0.1em', fontFamily: 'monospace', color: '#fff', textShadow: '0 0 10px #00ff41' };
+const inputStyle: React.CSSProperties = { padding: '15px', backgroundColor: 'transparent', border: '1px solid #00ff41', color: '#00ff41', fontFamily: 'monospace', fontSize: '1.2rem', width: '300px', outline: 'none', textAlign: 'center' };
+const buttonStyle: React.CSSProperties = { padding: '15px 35px', border: '2px solid #00ff41', backgroundColor: 'transparent', color: '#00ff41', fontFamily: 'monospace', cursor: 'pointer', fontSize: '1rem', letterSpacing: '0.2em', transition: 'all 0.2s' };
+const actionButtonStyle = (active: boolean): React.CSSProperties => ({ padding: '15px 30px', backgroundColor: '#000', color: active ? '#00ff41' : '#444', border: `2px solid ${active ? '#00ff41' : '#444'}`, fontFamily: 'monospace', cursor: active ? 'pointer' : 'not-allowed', fontSize: '1rem', letterSpacing: '2px', boxShadow: active ? '0 0 20px rgba(0,255,65,0.35)' : 'none', opacity: active ? 1 : 0.6, transition: 'all 0.2s ease-in-out', marginTop: '10px' });
+const resultOverlayStyle: React.CSSProperties = { position: 'absolute', top: '20%', left: '50%', transform: 'translate(-50%, -50%)', zIndex: 4500, padding: '30px 50px', backgroundColor: 'rgba(0,0,0,0.9)', border: '2px solid #00ff41', borderRadius: '8px', color: '#fff', textAlign: 'center', minWidth: '300px', boxShadow: '0 0 40px rgba(0,255,65,0.4)', fontFamily: 'monospace' };
