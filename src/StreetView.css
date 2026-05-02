@@ -257,3 +257,22 @@
 .empty-slot {
   padding: 15px; border: 1px dashed #444; color: #444; text-align: left;
 }
+.home-button {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  z-index: 4500;
+  background-color: rgba(0, 0, 0, 0.8);
+  color: #00ff41;
+  border: 1px solid #00ff41;
+  padding: 10px 15px;
+  font-family: monospace;
+  font-size: 0.9rem;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.home-button:hover {
+  background-color: rgba(0, 255, 65, 0.2);
+}
