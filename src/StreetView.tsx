@@ -35,53 +35,46 @@ export default function StreetView() {
   const [actualLocation, setActualLocation] = useState<{lat: number, lng: number} | null>(null);
   const [roundKey, setRoundKey] = useState(0);
 
-  // --- NEW: BACKGROUND QUEUE STATES ---
   const [nextQueuedLocation, setNextQueuedLocation] = useState<{lat: number, lng: number} | null>(null);
   const isPrefetchingRef = useRef(false);
 
-  // Global Player Identity
   const [playerName, setPlayerName] = useState('');
   const [avatarSeed, setAvatarSeed] = useState(() => Math.random().toString(36).substring(2, 9));
   const [playerId] = useState(() => Math.random().toString(36).substring(2, 9)); 
 
-  // Multiplayer & Lobby States
   const [lobbyCode, setLobbyCode] = useState('');
   const [joinCodeInput, setJoinCodeInput] = useState('');
   const [isHost, setIsHost] = useState(false);
   const [lobbyData, setLobbyData] = useState<any>(null);
 
-  // Settings
   const [settings, setSettings] = useState({ roundTime: 60, fastTimer: 15, maxRounds: 5, pointsToWin: 0, elimination: false });
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
   
-  // Single Player States
   const [spEndTime, setSpEndTime] = useState<number | null>(null);
   const [spScore, setSpScore] = useState(0);
   const [spRound, setSpRound] = useState(0);
   const [spResult, setSpResult] = useState<{points: number, distance: number, timeout: boolean} | null>(null);
 
-  // --- THE BACKGROUND SEARCHER ---
+  const [flashActive, setFlashActive] = useState(false);
+  const prevGuessesCount = useRef(0);
+
   const findValidLocation = async (): Promise<{lat: number, lng: number} | null> => {
     if (!googleServiceRef.current) return null;
     let attempts = 0;
     while (attempts < 50) {
       attempts++;
-      const lat = (Math.random() * 140) - 70;
-      const lng = (Math.random() * 360) - 180;
-      
+      const lat = (Math.random() * 140) - 70; const lng = (Math.random() * 360) - 180;
       try {
         const response = await googleServiceRef.current.getPanorama({ location: { lat, lng }, radius: 50000, source: 'outdoor' as any });
         if (response?.data && response.data.copyright?.includes('Google') && response.data.links?.length) {
           return { lat: response.data.location.latLng.lat(), lng: response.data.location.latLng.lng() };
         }
-      } catch (e) { /* Ignore 429s and keep searching */ }
-      
-      await new Promise(res => setTimeout(res, 250)); // Speed limit
+      } catch (e) { /* Ignore */ }
+      await new Promise(res => setTimeout(res, 250));
     }
     return null;
   };
 
-  // Silent Init Google Maps & Pre-fetch Round 1!
   useEffect(() => {
     let isMounted = true;
     const init = async () => {
@@ -95,22 +88,18 @@ export default function StreetView() {
             addressControl: false, showRoadLabels: false, motionTracking: false, motionTrackingControl: false
           });
         }
-
-        // Start pre-fetching the very first round instantly!
         if (!isPrefetchingRef.current && !nextQueuedLocation) {
           isPrefetchingRef.current = true;
           const loc = await findValidLocation();
           if (loc && isMounted) setNextQueuedLocation(loc);
           isPrefetchingRef.current = false;
         }
-
       } catch (err) { console.error(err); }
     };
     setTimeout(init, 500);
     return () => { isMounted = false; };
   }, []);
 
-  // --- MULTIPLAYER REAL-TIME LISTENER ---
   useEffect(() => {
     if (!lobbyCode) return;
     const unsub = onSnapshot(doc(db, 'lobbies', lobbyCode), (docSnap) => {
@@ -118,9 +107,9 @@ export default function StreetView() {
         const data = docSnap.data();
         setLobbyData(data);
         
-        if (data.status === 'PLAYING' && data.targetLocation && gameState !== 'PLAYING') {
+        if (data.status === 'PLAYING' && data.currentRound !== roundKey) {
+           setRoundKey(data.currentRound); 
            if (!isHost) executeWarp(data.targetLocation);
-           setCurrentGuess(null);
         }
         if (data.status === 'ROUND_OVER' && gameState !== 'ROUND_OVER') {
           setGameState('ROUND_OVER'); setActualLocation(data.targetLocation);
@@ -131,11 +120,35 @@ export default function StreetView() {
       }
     });
     return () => unsub(); 
-  }, [lobbyCode, isHost, gameState]);
+  }, [lobbyCode, isHost, gameState, roundKey]);
 
-  // --- TIMER LOGIC ---
+  useEffect(() => {
+    if (gameState !== 'PLAYING') {
+      prevGuessesCount.current = 0;
+      return;
+    }
+    const currentGuesses = lobbyCode && lobbyData ? lobbyData.players.filter((p:Player)=>p.currentGuess).length : 0;
+    if (currentGuesses > 0 && prevGuessesCount.current === 0) {
+        setFlashActive(true);
+        setTimeout(() => setFlashActive(false), 1500);
+    }
+    prevGuessesCount.current = currentGuesses;
+  }, [lobbyData, gameState, lobbyCode]);
+
+  useEffect(() => {
+    if (isHost && gameState === 'PLAYING' && lobbyCode && lobbyData) {
+      if (lobbyData.currentRound !== roundKey) return; 
+      const guessesCount = lobbyData.players.filter((p: Player) => p.currentGuess).length;
+      if (guessesCount > 0 && guessesCount === lobbyData.players.length) {
+        endRound(lobbyData);
+      }
+    }
+  }, [lobbyData, isHost, gameState, roundKey]);
+
   useEffect(() => {
     if (gameState !== 'PLAYING') { setTimeLeft(null); return; }
+    if (lobbyCode && lobbyData && lobbyData.currentRound !== roundKey) return;
+
     const targetEndTime = lobbyCode ? lobbyData?.roundEndTime : spEndTime;
     if (targetEndTime) {
       const interval = setInterval(() => {
@@ -148,51 +161,53 @@ export default function StreetView() {
       }, 500);
       return () => clearInterval(interval);
     }
-  }, [gameState, lobbyData, isHost, lobbyCode, spEndTime]);
+  }, [gameState, lobbyData, isHost, lobbyCode, spEndTime, roundKey]);
 
-  // Follower Warp (For multiplayer clients)
   const executeWarp = (pos: {lat: number, lng: number}) => {
-    setIsWarping(true); setGameState('PLAYING'); setRoundKey(prev => prev + 1);
+    setIsWarping(true); setGameState('PLAYING'); setCurrentGuess(null);
     panoInstance.current.setPosition(pos); panoInstance.current.setPov({ heading: Math.random() * 360, pitch: 0 });
     setDiagnostics({ status: 'TARGET LOCKED.' });
     setTimeout(() => setIsWarping(false), 800);
   };
 
-  // Host/Single Player Warp (Uses Queue)
   const handleChaosWarp = async () => {
     if (!googleServiceRef.current || !panoInstance.current) return;
     
-    setIsWarping(true); setGameState('PLAYING'); setCurrentGuess(null);
-    setRoundKey(prev => prev + 1); 
-
+    setIsWarping(true); 
     let pos = nextQueuedLocation;
 
-    // If the background prefetch hasn't finished yet, show searching text and wait for it
     if (!pos) {
       setDiagnostics({ status: 'SEARCHING SIGNAL...' });
       pos = await findValidLocation();
     }
 
     if (pos) {
-      // Consume the queued location
       setNextQueuedLocation(null); 
       panoInstance.current.setPosition(pos); setActualLocation(pos);
       panoInstance.current.setPov({ heading: Math.random() * 360, pitch: 0 });
       
       if (lobbyCode && isHost && lobbyData) {
+        const newRound = (lobbyData.currentRound || 0) + 1;
         const resetPlayers = lobbyData.players.map((p: Player) => ({ ...p, currentGuess: null, distance: null, pointsEarned: null }));
+        
+        setRoundKey(newRound);
+        setGameState('PLAYING');
+        setCurrentGuess(null);
+
         await updateDoc(doc(db, 'lobbies', lobbyCode), {
           status: 'PLAYING', targetLocation: pos, roundEndTime: Date.now() + (lobbyData.settings.roundTime * 1000),
-          currentRound: (lobbyData.currentRound || 0) + 1, players: resetPlayers
+          currentRound: newRound, players: resetPlayers
         });
       } else if (!lobbyCode) {
+        setRoundKey(prev => prev + 1);
+        setGameState('PLAYING');
+        setCurrentGuess(null);
         setSpEndTime(Date.now() + (180 * 1000)); setSpRound(prev => prev + 1); setSpResult(null);
       }
 
       setDiagnostics({ status: 'TARGET LOCKED.' });
       setTimeout(() => setIsWarping(false), 800);
 
-      // SILENTLY START SEARCHING FOR THE NEXT ROUND IN THE BACKGROUND!
       if (!isPrefetchingRef.current) {
          isPrefetchingRef.current = true;
          findValidLocation().then(newLoc => {
@@ -200,7 +215,6 @@ export default function StreetView() {
             isPrefetchingRef.current = false;
          });
       }
-
     } else {
       setDiagnostics({ status: 'WARP FAILED. TRY AGAIN.' });
       setTimeout(() => setIsWarping(false), 1500);
@@ -214,20 +228,20 @@ export default function StreetView() {
   };
 
   const submitGuess = async () => {
-    if (!currentGuess || !actualLocation || gameState !== 'PLAYING') return;
+    if (!currentGuess || gameState !== 'PLAYING') return;
 
     if (lobbyCode && lobbyData) {
       const updatedPlayers = lobbyData.players.map((p: Player) => p.id === playerId ? { ...p, currentGuess } : p);
       let newEndTime = lobbyData.roundEndTime;
       const guessesCount = updatedPlayers.filter((p: Player) => p.currentGuess).length;
 
-      if (guessesCount === 1) {
+      if (guessesCount === 1 && lobbyData.settings.fastTimer > 0) {
         const potentialEnd = Date.now() + (lobbyData.settings.fastTimer * 1000);
         if (potentialEnd < newEndTime) newEndTime = potentialEnd;
       }
       await updateDoc(doc(db, 'lobbies', lobbyCode), { players: updatedPlayers, roundEndTime: newEndTime });
-      if (isHost && guessesCount === lobbyData.players.length) endRound({ ...lobbyData, players: updatedPlayers });
     } else {
+      if (!actualLocation) return;
       const dist = calculateDistance(currentGuess, actualLocation);
       const pts = Math.max(0, Math.round(5000 * Math.exp(-dist / 2000)));
       setSpScore(prev => prev + pts); setSpResult({ points: pts, distance: dist, timeout: false });
@@ -280,34 +294,51 @@ export default function StreetView() {
 
   const returnHome = () => { setGameState('START'); setLobbyCode(''); setSpScore(0); setSpRound(0); setSpEndTime(null); };
 
+  // THE FIX: Strict Guard so the host is never locked in by stale Firebase data
+  const isLockedIn = lobbyCode && lobbyData?.currentRound === roundKey
+    ? !!lobbyData?.players.find((p:Player)=>p.id===playerId)?.currentGuess 
+    : false;
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.code === 'Space' && currentGuess && gameState === 'PLAYING') { e.preventDefault(); submitGuess(); }
+      if (e.code === 'Space' && currentGuess && gameState === 'PLAYING' && !isLockedIn) { e.preventDefault(); submitGuess(); }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [currentGuess, gameState, submitGuess]);
+  }, [currentGuess, gameState, submitGuess, isLockedIn]);
 
   return (
     <div style={{ width: '100vw', height: '100vh', backgroundColor: '#000', position: 'relative', overflow: 'hidden' }}>
       
-      {/* Radar Animation CSS */}
       <style>{`
         @keyframes radar-scan { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         .radar-box { position: relative; width: 100px; height: 100px; border-radius: 50%; border: 1px solid #00ff41; margin-bottom: 30px; background: linear-gradient(90deg, transparent 49%, rgba(0, 255, 65, 0.4) 50%, transparent 51%), linear-gradient(0deg, transparent 49%, rgba(0, 255, 65, 0.4) 50%, transparent 51%); box-shadow: 0 0 20px rgba(0,255,65,0.2), inset 0 0 20px rgba(0,255,65,0.2); overflow: hidden; }
         .radar-beam { position: absolute; top: 0; left: 0; width: 50%; height: 50%; background: conic-gradient(from 180deg at 100% 100%, transparent 0deg, rgba(0, 255, 65, 0.8) 90deg); transform-origin: 100% 100%; animation: radar-scan 1.5s linear infinite; }
         .radar-dot { position: absolute; top: 50%; left: 50%; width: 6px; height: 6px; background: #fff; border-radius: 50%; transform: translate(-50%, -50%); box-shadow: 0 0 10px #fff, 0 0 20px #00ff41; }
+        
+        @keyframes damage-flash {
+          0% { box-shadow: inset 0 0 0px rgba(255, 0, 60, 0); background-color: rgba(255, 0, 60, 0); }
+          10% { box-shadow: inset 0 0 150px rgba(255, 0, 60, 0.8); background-color: rgba(255, 0, 60, 0.2); }
+          100% { box-shadow: inset 0 0 0px rgba(255, 0, 60, 0); background-color: rgba(255, 0, 60, 0); }
+        }
+        .damage-overlay { position: absolute; inset: 0; z-index: 3900; pointer-events: none; animation: damage-flash 1.5s ease-out forwards; }
+        
+        @keyframes timer-pulse-big {
+          0% { transform: scale(1); }
+          10% { transform: scale(2.5); color: #ff003c; text-shadow: 0 0 30px #ff003c; }
+          100% { transform: scale(1); color: #ff003c; }
+        }
+        .timer-flash { animation: timer-pulse-big 1.5s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
       `}</style>
 
-      {/* Back to Home Button */}
+      {flashActive && <div className="damage-overlay"></div>}
+
       {!['PROFILE_SETUP', 'START', 'MP_MENU', 'CREATE_LOBBY', 'JOIN_LOBBY'].includes(gameState) && !isWarping && (
         <button onClick={returnHome} style={{...buttonStyle, position: 'absolute', top: '10px', left: '10px', zIndex: 4500, padding: '10px', width: 'auto'}}>← HOME</button>
       )}
 
-      {/* The Map */}
       <div ref={mapRef} style={{ width: '100%', height: '100%', position: 'absolute', opacity: (['PROFILE_SETUP', 'START', 'MP_MENU', 'CREATE_LOBBY', 'JOIN_LOBBY', 'LOBBY', 'ROUND_OVER', 'GAME_OVER'].includes(gameState) || isWarping) ? 0 : 1, transition: 'opacity 0.6s ease' }} />
 
-      {/* Warping Loading Screen */}
       <div style={{ position: 'absolute', inset: 0, zIndex: 4000, backgroundColor: '#000', display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', transition: 'opacity 0.4s', opacity: isWarping ? 1 : 0, pointerEvents: isWarping ? 'all' : 'none' }}>
         <div className="radar-box"><div className="radar-beam"></div><div className="radar-dot"></div></div>
         <div style={{ color: '#00ff41', fontFamily: 'monospace', fontSize: '2rem', letterSpacing: '8px' }}>WARPING...</div>
@@ -315,15 +346,18 @@ export default function StreetView() {
       </div>
 
       {gameState === 'PLAYING' && (
-        <div style={{ position: 'absolute', top: '10px', right: '10px', zIndex: 3500, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '10px', pointerEvents: 'none' }}>
+        <div style={{ position: 'absolute', top: '20px', right: '20px', zIndex: 3500, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '10px', pointerEvents: 'none' }}>
            {timeLeft !== null && (
-             <div style={{ fontSize: '2rem', fontWeight: 'bold', color: timeLeft <= 15 ? '#ff003c' : '#fff', textShadow: `0 0 10px ${timeLeft <= 15 ? '#ff003c' : '#00ff41'}`, fontFamily: 'monospace', background: 'rgba(0,0,0,0.8)', padding: '5px 15px', border: `1px solid ${timeLeft <= 15 ? '#ff003c' : '#00ff41'}`, borderRadius: '4px' }}>
-               00:{timeLeft.toString().padStart(2, '0')}
+             <div className={flashActive ? 'timer-flash' : ''} style={{ transformOrigin: 'top right' }}>
+               <div style={{ fontSize: '2rem', fontWeight: 'bold', color: timeLeft <= 15 ? '#ff003c' : '#fff', textShadow: `0 0 10px ${timeLeft <= 15 ? '#ff003c' : '#00ff41'}`, fontFamily: 'monospace', background: 'rgba(0,0,0,0.8)', padding: '5px 15px', border: `1px solid ${timeLeft <= 15 ? '#ff003c' : '#00ff41'}`, borderRadius: '4px' }}>
+                 00:{timeLeft.toString().padStart(2, '0')}
+               </div>
              </div>
            )}
+
            {lobbyCode ? (
              <div style={{ background: 'rgba(0,0,0,0.8)', padding: '10px', border: '1px solid #00ff41', fontFamily: 'monospace', borderRadius: '4px' }}>
-               {lobbyData?.players.map((p: Player) => <div key={p.id} style={{ color: p.currentGuess ? '#00ff41' : '#fff' }}>{p.currentGuess ? '✅' : '⏳'} {p.name}</div>)}
+               {lobbyData?.players.map((p: Player) => <div key={p.id} style={{ color: p.currentGuess ? '#00ff41' : '#fff', margin: '5px 0' }}>{p.currentGuess ? '✅' : '⏳'} {p.name}</div>)}
              </div>
            ) : (
              <div style={{ background: 'rgba(0,0,0,0.8)', padding: '10px', border: '1px solid #00ff41', color: '#00ff41', fontFamily: 'monospace', borderRadius: '4px' }}>
@@ -333,57 +367,66 @@ export default function StreetView() {
         </div>
       )}
 
+      {/* THE FIX: Unified permanent GuessMap that never unmounts! */}
+      {['PLAYING', 'ROUND_OVER', 'GAME_OVER'].includes(gameState) && (
+        <GuessMap 
+          onGuessSelected={setCurrentGuess} 
+          actualLocation={gameState !== 'PLAYING' ? actualLocation : null} 
+          allGuesses={gameState === 'PLAYING' ? [] : (lobbyCode && lobbyData ? lobbyData.players : (currentGuess ? [{name: playerName, avatarSeed, currentGuess}] : []))} 
+          roundKey={roundKey} 
+          isLockedIn={isLockedIn} 
+        />
+      )}
+
       {gameState === 'PLAYING' && (
-        <>
-          <GuessMap onGuessSelected={setCurrentGuess} actualLocation={null} allGuesses={[]} roundKey={roundKey} />
-          <div style={{ position: 'absolute', bottom: '20px', left: '50%', transform: 'translateX(-50%)', zIndex: 3500, display: 'flex', width: '90%', maxWidth: '300px' }}>
-             {lobbyCode ? (
-               <button onClick={submitGuess} disabled={!currentGuess || lobbyData?.players.find((p:Player)=>p.id===playerId)?.currentGuess} style={{...actionButtonStyle(!!currentGuess), width: '100%'}}>
-                 {lobbyData?.players.find((p:Player)=>p.id===playerId)?.currentGuess ? 'LOCKED IN' : 'LOCK GUESS'}
-               </button>
-             ) : (
-               <button onClick={submitGuess} disabled={!currentGuess} style={{...actionButtonStyle(!!currentGuess), width: '100%'}}>LOCK GUESS [SPACE]</button>
-             )}
-          </div>
-        </>
+        <div style={{ position: 'absolute', bottom: '20px', left: '50%', transform: 'translateX(-50%)', zIndex: 3500, display: 'flex', width: '90%', maxWidth: '300px' }}>
+           {lobbyCode ? (
+             <button onClick={submitGuess} disabled={!currentGuess || isLockedIn} style={{...actionButtonStyle(!!currentGuess && !isLockedIn), width: '100%', backgroundColor: isLockedIn ? '#00ff41' : '#000', color: isLockedIn ? '#000' : '#00ff41'}}>
+               {isLockedIn ? 'WAITING FOR PLAYERS...' : 'LOCK GUESS'}
+             </button>
+           ) : (
+             <button onClick={submitGuess} disabled={!currentGuess} style={{...actionButtonStyle(!!currentGuess), width: '100%'}}>LOCK GUESS [SPACE]</button>
+           )}
+        </div>
       )}
 
       {gameState === 'ROUND_OVER' && !lobbyCode && spResult && (
-        <>
-          <GuessMap onGuessSelected={() => {}} actualLocation={actualLocation} allGuesses={currentGuess ? [{name: playerName, avatarSeed: avatarSeed, currentGuess}] : []} roundKey={roundKey} />
-          <div style={resultOverlayStyle}>
-            <div style={{ fontSize: '1.2rem', marginBottom: '15px', borderBottom: '1px solid #00ff41', paddingBottom: '5px' }}>{spResult.timeout ? 'SIGNAL LOST' : 'MISSION COMPLETE'}</div>
-            {spResult.timeout ? (
-              <div style={{ fontSize: '1.5rem', color: '#ff003c', margin: '20px 0' }}>TARGET NOT LOCATED IN TIME</div>
-            ) : (
-              <>
-                <div style={{ fontSize: '3rem', fontWeight: 'bold', color: '#fff', textShadow: '0 0 20px #00ff41' }}>{spResult.points} <span style={{ fontSize: '1.5rem', opacity: 0.7 }}>PTS</span></div>
-                <div style={{ fontSize: '1.5rem', color: '#00ff41', marginTop: '10px' }}>{spResult.distance < 1 ? `${(spResult.distance * 1000).toFixed(0)} meters` : `${spResult.distance.toFixed(1)} km`}</div>
-              </>
-            )}
-            <button onClick={handleChaosWarp} style={{...actionButtonStyle(true), marginTop: '20px'}}>NEXT ROUND</button>
-          </div>
-        </>
+        <div style={resultOverlayStyle}>
+          <div style={{ fontSize: '1.2rem', marginBottom: '15px', borderBottom: '1px solid #00ff41', paddingBottom: '5px' }}>{spResult.timeout ? 'SIGNAL LOST' : 'MISSION COMPLETE'}</div>
+          {spResult.timeout ? (
+            <div style={{ fontSize: '1.5rem', color: '#ff003c', margin: '20px 0' }}>TARGET NOT LOCATED IN TIME</div>
+          ) : (
+            <>
+              <div style={{ fontSize: '3rem', fontWeight: 'bold', color: '#fff', textShadow: '0 0 20px #00ff41' }}>{spResult.points} <span style={{ fontSize: '1.5rem', opacity: 0.7 }}>PTS</span></div>
+              <div style={{ fontSize: '1.5rem', color: '#00ff41', marginTop: '10px' }}>{spResult.distance < 1 ? `${(spResult.distance * 1000).toFixed(0)} meters` : `${spResult.distance.toFixed(1)} km`}</div>
+            </>
+          )}
+          <button onClick={handleChaosWarp} style={{...actionButtonStyle(true), marginTop: '20px'}}>NEXT ROUND</button>
+        </div>
       )}
 
       {['ROUND_OVER', 'GAME_OVER'].includes(gameState) && lobbyCode && lobbyData && (
-        <>
-          <GuessMap onGuessSelected={() => {}} actualLocation={actualLocation} allGuesses={lobbyData.players} roundKey={roundKey} />
-          <div style={{...resultOverlayStyle, maxHeight: '80vh', overflowY: 'auto'}}>
-            <h2 style={{ color: gameState === 'GAME_OVER' ? '#ffd700' : '#00ff41', margin: '0 0 15px 0' }}>{gameState === 'GAME_OVER' ? 'GAME COMPLETE' : `ROUND ${lobbyData.currentRound} COMPLETE`}</h2>
-            <div style={{ textAlign: 'left', borderTop: '1px solid #444' }}>
-              {lobbyData.players.map((p: Player, i: number) => (
-                <div key={p.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '10px 0', borderBottom: '1px solid #444' }}>
-                  <span style={{ fontWeight: 'bold' }}>{i + 1}. {p.name}</span>
-                  <span><span style={{ color: '#aaa', fontSize: '0.8rem', marginRight: '10px' }}>+{p.pointsEarned || 0}</span><span style={{ color: '#00ff41', fontWeight: 'bold' }}>{p.score}</span></span>
+        <div style={resultOverlayStyle}>
+          <h2 style={{ color: gameState === 'GAME_OVER' ? '#ffd700' : '#00ff41', margin: '0 0 15px 0' }}>{gameState === 'GAME_OVER' ? 'GAME COMPLETE' : `ROUND ${lobbyData.currentRound} COMPLETE`}</h2>
+          <div style={{ textAlign: 'left', borderTop: '1px solid #444' }}>
+            {lobbyData.players.map((p: Player, i: number) => (
+              <div key={p.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid #444' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                   <span style={{ fontWeight: 'bold', width: '20px' }}>{i + 1}.</span>
+                   <img src={`https://api.dicebear.com/8.x/bottts/svg?seed=${p.avatarSeed}`} alt="avatar" style={{width: '35px', height: '35px', borderRadius: '50%', background: 'rgba(255,255,255,0.1)'}} />
+                   <span style={{ fontWeight: 'bold' }}>{p.name}</span>
                 </div>
-              ))}
-            </div>
-            {isHost ? (
-               <button onClick={gameState === 'GAME_OVER' ? returnHome : handleChaosWarp} style={{...actionButtonStyle(true), marginTop: '20px'}}>{gameState === 'GAME_OVER' ? 'END GAME' : 'NEXT ROUND'}</button>
-            ) : <div style={{ color: '#888', marginTop: '20px' }}>WAITING FOR HOST...</div>}
+                <div style={{ textAlign: 'right' }}>
+                  <div style={{ color: '#00ff41', fontWeight: 'bold', fontSize: '1.2rem' }}>{p.score}</div>
+                  <div style={{ color: '#aaa', fontSize: '0.8rem' }}>+{p.pointsEarned || 0}</div>
+                </div>
+              </div>
+            ))}
           </div>
-        </>
+          {isHost ? (
+             <button onClick={gameState === 'GAME_OVER' ? returnHome : handleChaosWarp} style={{...actionButtonStyle(true), marginTop: '20px'}}>{gameState === 'GAME_OVER' ? 'END GAME' : 'NEXT ROUND'}</button>
+          ) : <div style={{ color: '#888', marginTop: '20px' }}>WAITING FOR HOST...</div>}
+        </div>
       )}
 
       {gameState === 'PROFILE_SETUP' && (
@@ -478,4 +521,4 @@ const inputStyle: React.CSSProperties = { padding: '15px', backgroundColor: 'tra
 const buttonStyle: React.CSSProperties = { padding: '15px', border: '2px solid #00ff41', backgroundColor: 'transparent', color: '#00ff41', fontFamily: '"Outfit", monospace', cursor: 'pointer', fontSize: '1rem', letterSpacing: '0.2em', transition: 'all 0.2s', width: '100%', maxWidth: '300px', boxSizing: 'border-box' };
 const actionButtonStyle = (active: boolean): React.CSSProperties => ({ padding: '15px', backgroundColor: '#000', color: active ? '#00ff41' : '#444', border: `2px solid ${active ? '#00ff41' : '#444'}`, fontFamily: '"Outfit", monospace', cursor: active ? 'pointer' : 'not-allowed', fontSize: '1rem', letterSpacing: '2px', boxShadow: active ? '0 0 20px rgba(0,255,65,0.35)' : 'none', opacity: active ? 1 : 0.6, width: '100%', maxWidth: '300px', boxSizing: 'border-box', transition: 'all 0.2s' });
 
-const resultOverlayStyle: React.CSSProperties = { position: 'absolute', top: '40px', left: '50%', transform: 'translateX(-50%)', zIndex: 4500, padding: '20px 30px', backgroundColor: 'rgba(0,0,0,0.95)', border: '2px solid #00ff41', borderRadius: '8px', color: '#fff', textAlign: 'center', width: '90%', maxWidth: '500px', maxHeight: '45vh', overflowY: 'auto', boxShadow: '0 0 40px rgba(0,255,65,0.4)', fontFamily: '"Outfit", monospace', boxSizing: 'border-box' };
+const resultOverlayStyle: React.CSSProperties = { position: 'absolute', top: '40px', left: '50%', transform: 'translateX(-50%)', zIndex: 4500, padding: '20px 30px', backgroundColor: 'rgba(0,0,0,0.95)', border: '2px solid #00ff41', borderRadius: '8px', color: '#fff', width: '90%', maxWidth: '500px', maxHeight: '45vh', overflowY: 'auto', boxShadow: '0 0 40px rgba(0,255,65,0.4)', fontFamily: '"Outfit", monospace', boxSizing: 'border-box' };

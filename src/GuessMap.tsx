@@ -6,9 +6,10 @@ interface GuessMapProps {
   actualLocation: { lat: number, lng: number } | null;
   allGuesses?: any[];
   roundKey: number;
+  isLockedIn?: boolean;
 }
 
-export default function GuessMap({ onGuessSelected, actualLocation, allGuesses, roundKey }: GuessMapProps) {
+export default function GuessMap({ onGuessSelected, actualLocation, allGuesses, roundKey, isLockedIn }: GuessMapProps) {
   const mapDivRef = useRef<HTMLDivElement>(null);
   const mapInstance = useRef<any>(null);
   const localGuessMarkerRef = useRef<any>(null);
@@ -21,6 +22,12 @@ export default function GuessMap({ onGuessSelected, actualLocation, allGuesses, 
   const isPlayingRef = useRef(true);
   const resultShownRef = useRef(false);
 
+  // THE FIX: This Ref ensures the map listener ALWAYS knows the true lock status
+  const isLockedInRef = useRef(isLockedIn);
+  useEffect(() => {
+    isLockedInRef.current = isLockedIn;
+  }, [isLockedIn]);
+
   // 1. Init
   useEffect(() => {
     const initMap = async () => {
@@ -31,7 +38,9 @@ export default function GuessMap({ onGuessSelected, actualLocation, allGuesses, 
         });
 
         mapInstance.current.addListener('click', async (e: any) => {
-          if (!isPlayingRef.current) return;
+          // Now safely checks the dynamic Ref instead of a frozen state
+          if (!isPlayingRef.current || isLockedInRef.current) return; 
+          
           const { Marker } = await importLibrary('marker') as any;
           const latLng = { lat: e.latLng.lat(), lng: e.latLng.lng() };
           
@@ -42,7 +51,7 @@ export default function GuessMap({ onGuessSelected, actualLocation, allGuesses, 
       }
     };
     initMap();
-  }, [onGuessSelected]);
+  }, [onGuessSelected]); // Removed isLockedIn dependency to prevent duplicate listener attempts
 
   // 2. Reset
   useEffect(() => {
@@ -80,21 +89,16 @@ export default function GuessMap({ onGuessSelected, actualLocation, allGuesses, 
 
           let playersToPlot = (allGuesses && allGuesses.length > 0) ? allGuesses : [];
 
-          // Loop through every player and draw their marker and line
           playersToPlot.forEach((player) => {
               if (!player.currentGuess) return; 
               bounds.extend(player.currentGuess);
 
-              // Find this inside your playersToPlot.forEach loop:
-              const avatarUrl = `https://api.dicebear.com/8.x/bottts/svg?seed=${player.avatarSeed}`;
-
               playerMarkersRef.current.push(new googleNamespace.maps.Marker({
-                  position: player.currentGuess, 
-                  map: mapInstance.current,
+                  position: player.currentGuess, map: mapInstance.current,
                   icon: {
-                      url: avatarUrl,
-                      scaledSize: new googleNamespace.maps.Size(40, 40), // Makes the avatar a nice size
-                      anchor: new googleNamespace.maps.Point(20, 20)     // Centers the image exactly on the coordinate
+                      url: `https://api.dicebear.com/8.x/bottts/svg?seed=${player.avatarSeed}`,
+                      scaledSize: new googleNamespace.maps.Size(40, 40),
+                      anchor: new googleNamespace.maps.Point(20, 20)
                   },
                   title: player.name,
               }));
@@ -135,7 +139,6 @@ export default function GuessMap({ onGuessSelected, actualLocation, allGuesses, 
   const getDynamicDimensions = () => {
     switch (mapSize) {
       case 'L': return { width: '90vw', height: '70vh', bottom: '15vh', left: '5vw' };
-      // FIX: Updated M size to fill the bottom 45% of the screen
       case 'M': return { width: '90vw', maxWidth: '800px', height: '45vh', bottom: '20px', left: '50%', transform: 'translateX(-50%)' };
       case 'S': default: return { width: '150px', height: '150px', bottom: '90px', left: '20px' };
     }
