@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { importLibrary, setOptions } from '@googlemaps/js-api-loader';
-import { doc, setDoc, getDoc, updateDoc, onSnapshot } from 'firebase/firestore';
+import { doc, setDoc, getDoc, updateDoc, onSnapshot, arrayUnion } from 'firebase/firestore';
 import { db } from './firebase'; 
 import GuessMap from './GuessMap';
 
@@ -17,15 +17,24 @@ interface Player {
   avatarSeed: string;
   isHost: boolean;
   score: number;
+  team: 'RED' | 'BLUE' | 'NONE'; 
   currentGuess: { lat: number, lng: number } | null;
   distance: number | null;
   pointsEarned: number | null;
+}
+
+interface ChatMessage {
+  id: string;
+  sender: string;
+  text: string;
+  team: 'RED' | 'BLUE';
 }
 
 export default function StreetView() {
   const mapRef = useRef<HTMLDivElement>(null);
   const panoInstance = useRef<any>(null);
   const googleServiceRef = useRef<any>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null); 
   
   const [gameState, setGameState] = useState<GameState>('PROFILE_SETUP');
   const [isWarping, setIsWarping] = useState(false);
@@ -47,8 +56,9 @@ export default function StreetView() {
   const [isHost, setIsHost] = useState(false);
   const [lobbyData, setLobbyData] = useState<any>(null);
 
-  const [settings, setSettings] = useState({ roundTime: 60, fastTimer: 15, maxRounds: 5, pointsToWin: 0, elimination: false });
+  const [settings, setSettings] = useState({ mode: 'FFA', roundTime: 60, fastTimer: 15, maxRounds: 5, pointsToWin: 0, elimination: false });
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
+  const [chatInput, setChatInput] = useState('');
   
   const [spEndTime, setSpEndTime] = useState<number | null>(null);
   const [spScore, setSpScore] = useState(0);
@@ -57,6 +67,10 @@ export default function StreetView() {
 
   const [flashActive, setFlashActive] = useState(false);
   const prevGuessesCount = useRef(0);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [lobbyData?.messages]);
 
   const findValidLocation = async (): Promise<{lat: number, lng: number} | null> => {
     if (!googleServiceRef.current) return null;
@@ -123,10 +137,7 @@ export default function StreetView() {
   }, [lobbyCode, isHost, gameState, roundKey]);
 
   useEffect(() => {
-    if (gameState !== 'PLAYING') {
-      prevGuessesCount.current = 0;
-      return;
-    }
+    if (gameState !== 'PLAYING') { prevGuessesCount.current = 0; return; }
     const currentGuesses = lobbyCode && lobbyData ? lobbyData.players.filter((p:Player)=>p.currentGuess).length : 0;
     if (currentGuesses > 0 && prevGuessesCount.current === 0) {
         setFlashActive(true);
@@ -139,9 +150,7 @@ export default function StreetView() {
     if (isHost && gameState === 'PLAYING' && lobbyCode && lobbyData) {
       if (lobbyData.currentRound !== roundKey) return; 
       const guessesCount = lobbyData.players.filter((p: Player) => p.currentGuess).length;
-      if (guessesCount > 0 && guessesCount === lobbyData.players.length) {
-        endRound(lobbyData);
-      }
+      if (guessesCount > 0 && guessesCount === lobbyData.players.length) endRound(lobbyData);
     }
   }, [lobbyData, isHost, gameState, roundKey]);
 
@@ -172,14 +181,10 @@ export default function StreetView() {
 
   const handleChaosWarp = async () => {
     if (!googleServiceRef.current || !panoInstance.current) return;
-    
     setIsWarping(true); 
     let pos = nextQueuedLocation;
 
-    if (!pos) {
-      setDiagnostics({ status: 'SEARCHING SIGNAL...' });
-      pos = await findValidLocation();
-    }
+    if (!pos) { setDiagnostics({ status: 'SEARCHING SIGNAL...' }); pos = await findValidLocation(); }
 
     if (pos) {
       setNextQueuedLocation(null); 
@@ -190,18 +195,13 @@ export default function StreetView() {
         const newRound = (lobbyData.currentRound || 0) + 1;
         const resetPlayers = lobbyData.players.map((p: Player) => ({ ...p, currentGuess: null, distance: null, pointsEarned: null }));
         
-        setRoundKey(newRound);
-        setGameState('PLAYING');
-        setCurrentGuess(null);
-
+        setRoundKey(newRound); setGameState('PLAYING'); setCurrentGuess(null);
         await updateDoc(doc(db, 'lobbies', lobbyCode), {
           status: 'PLAYING', targetLocation: pos, roundEndTime: Date.now() + (lobbyData.settings.roundTime * 1000),
           currentRound: newRound, players: resetPlayers
         });
       } else if (!lobbyCode) {
-        setRoundKey(prev => prev + 1);
-        setGameState('PLAYING');
-        setCurrentGuess(null);
+        setRoundKey(prev => prev + 1); setGameState('PLAYING'); setCurrentGuess(null);
         setSpEndTime(Date.now() + (180 * 1000)); setSpRound(prev => prev + 1); setSpResult(null);
       }
 
@@ -210,10 +210,7 @@ export default function StreetView() {
 
       if (!isPrefetchingRef.current) {
          isPrefetchingRef.current = true;
-         findValidLocation().then(newLoc => {
-            if (newLoc) setNextQueuedLocation(newLoc);
-            isPrefetchingRef.current = false;
-         });
+         findValidLocation().then(newLoc => { if (newLoc) setNextQueuedLocation(newLoc); isPrefetchingRef.current = false; });
       }
     } else {
       setDiagnostics({ status: 'WARP FAILED. TRY AGAIN.' });
@@ -251,28 +248,68 @@ export default function StreetView() {
 
   const endRound = async (currentData: any) => {
     if (!isHost) return;
+
+    let roundRedBest = 0;
+    let roundBlueBest = 0;
+
+    // First pass: Calculate everyone's individual score and find the BEST score for each team
     const scoredPlayers = currentData.players.map((p: Player) => {
       let pts = 0, dist = null;
       if (p.currentGuess && currentData.targetLocation) {
         dist = calculateDistance(p.currentGuess, currentData.targetLocation);
         pts = Math.max(0, Math.round(5000 * Math.exp(-dist / 2000)));
+        
+        // Track the highest score for the team
+        if (currentData.settings.mode === 'TEAMS') {
+          if (p.team === 'RED' && pts > roundRedBest) roundRedBest = pts;
+          if (p.team === 'BLUE' && pts > roundBlueBest) roundBlueBest = pts;
+        }
       }
       return { ...p, distance: dist, pointsEarned: pts, score: (p.score || 0) + pts };
     }).sort((a: Player, b: Player) => b.score - a.score);
 
+    // Update Team Scores based ONLY on the best player's guess
+    const newTeamScores = {
+      RED: (currentData.teamScores?.RED || 0) + roundRedBest,
+      BLUE: (currentData.teamScores?.BLUE || 0) + roundBlueBest
+    };
+
     const isMax = currentData.currentRound >= currentData.settings.maxRounds;
-    const isWin = currentData.settings.pointsToWin > 0 && scoredPlayers.some((p: Player) => p.score >= currentData.settings.pointsToWin);
     
+    // Check Win Condition
+    let isWin = false;
+    if (currentData.settings.pointsToWin > 0) {
+      if (currentData.settings.mode === 'TEAMS') {
+        isWin = Math.max(newTeamScores.RED, newTeamScores.BLUE) >= currentData.settings.pointsToWin;
+      } else {
+        isWin = scoredPlayers.some((p: Player) => p.score >= currentData.settings.pointsToWin);
+      }
+    }
+
     if (currentData.settings.elimination && scoredPlayers.length > 1) { scoredPlayers[scoredPlayers.length - 1].name += " [ELIMINATED]"; }
 
-    await updateDoc(doc(db, 'lobbies', lobbyCode), { status: (isMax || isWin) ? 'GAME_OVER' : 'ROUND_OVER', players: scoredPlayers });
+    await updateDoc(doc(db, 'lobbies', lobbyCode), { 
+      status: (isMax || isWin) ? 'GAME_OVER' : 'ROUND_OVER', 
+      players: scoredPlayers,
+      teamScores: newTeamScores // Save the pure team scores to the DB
+    });
   };
 
   const handleCreateLobby = async (e: React.FormEvent) => {
     e.preventDefault();
     const newCode = Math.floor(10000 + Math.random() * 90000).toString();
-    const newPlayer = { id: playerId, name: playerName, avatarSeed, isHost: true, score: 0, currentGuess: null, distance: null, pointsEarned: null };
-    await setDoc(doc(db, 'lobbies', newCode), { status: 'LOBBY', targetLocation: null, players: [newPlayer], settings, currentRound: 0 });
+    const newPlayer: Player = { id: playerId, name: playerName, avatarSeed, isHost: true, score: 0, currentGuess: null, distance: null, pointsEarned: null, team: settings.mode === 'TEAMS' ? 'RED' : 'NONE' };
+    
+    await setDoc(doc(db, 'lobbies', newCode), { 
+      status: 'LOBBY', 
+      targetLocation: null, 
+      players: [newPlayer], 
+      settings, 
+      currentRound: 0, 
+      messages: [],
+      teamScores: { RED: 0, BLUE: 0 } // Initialize Team Scores
+    });
+    
     setLobbyCode(newCode); setIsHost(true); setGameState('LOBBY');
   };
 
@@ -286,21 +323,49 @@ export default function StreetView() {
       const data = lobbySnap.data();
       if (data.players.length >= 8) return alert("Lobby full!");
       if (data.status !== 'LOBBY') return alert("Game in progress!");
-      const newPlayer = { id: playerId, name: playerName, avatarSeed, isHost: false, score: 0, currentGuess: null, distance: null, pointsEarned: null };
+      
+      let assignedTeam: 'RED' | 'BLUE' | 'NONE' = 'NONE';
+      if (data.settings.mode === 'TEAMS') {
+         const redCount = data.players.filter((p:Player) => p.team === 'RED').length;
+         const blueCount = data.players.filter((p:Player) => p.team === 'BLUE').length;
+         assignedTeam = redCount <= blueCount ? 'RED' : 'BLUE';
+      }
+
+      const newPlayer: Player = { id: playerId, name: playerName, avatarSeed, isHost: false, score: 0, currentGuess: null, distance: null, pointsEarned: null, team: assignedTeam };
       await updateDoc(lobbyRef, { players: [...data.players, newPlayer] });
       setLobbyCode(joinCodeInput); setIsHost(false); setGameState('LOBBY');
     } else alert("Lobby not found.");
   };
 
+  const switchTeam = async () => {
+    if (!lobbyCode || !lobbyData) return;
+    const updatedPlayers = lobbyData.players.map((p: Player) => {
+      if (p.id === playerId) return { ...p, team: p.team === 'RED' ? 'BLUE' : 'RED' };
+      return p;
+    });
+    await updateDoc(doc(db, 'lobbies', lobbyCode), { players: updatedPlayers });
+  };
+
+  const sendChat = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!chatInput.trim() || !lobbyCode || !lobbyData) return;
+    const myTeam = lobbyData.players.find((p:Player) => p.id === playerId)?.team;
+    
+    await updateDoc(doc(db, 'lobbies', lobbyCode), {
+      messages: arrayUnion({ id: Math.random().toString(), sender: playerName, text: chatInput, team: myTeam })
+    });
+    setChatInput('');
+  };
+
   const returnHome = () => { setGameState('START'); setLobbyCode(''); setSpScore(0); setSpRound(0); setSpEndTime(null); };
 
-  // THE FIX: Strict Guard so the host is never locked in by stale Firebase data
-  const isLockedIn = lobbyCode && lobbyData?.currentRound === roundKey
-    ? !!lobbyData?.players.find((p:Player)=>p.id===playerId)?.currentGuess 
-    : false;
+  const isLockedIn = lobbyCode && lobbyData?.currentRound === roundKey ? !!lobbyData?.players.find((p:Player)=>p.id===playerId)?.currentGuess : false;
+  const myPlayer = lobbyData?.players.find((p:Player) => p.id === playerId);
+  const myTeamColor = myPlayer?.team === 'RED' ? '#ff003c' : '#0088ff';
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (document.activeElement?.tagName === 'INPUT') return; 
       if (e.code === 'Space' && currentGuess && gameState === 'PLAYING' && !isLockedIn) { e.preventDefault(); submitGuess(); }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -316,25 +381,43 @@ export default function StreetView() {
         .radar-beam { position: absolute; top: 0; left: 0; width: 50%; height: 50%; background: conic-gradient(from 180deg at 100% 100%, transparent 0deg, rgba(0, 255, 65, 0.8) 90deg); transform-origin: 100% 100%; animation: radar-scan 1.5s linear infinite; }
         .radar-dot { position: absolute; top: 50%; left: 50%; width: 6px; height: 6px; background: #fff; border-radius: 50%; transform: translate(-50%, -50%); box-shadow: 0 0 10px #fff, 0 0 20px #00ff41; }
         
-        @keyframes damage-flash {
-          0% { box-shadow: inset 0 0 0px rgba(255, 0, 60, 0); background-color: rgba(255, 0, 60, 0); }
-          10% { box-shadow: inset 0 0 150px rgba(255, 0, 60, 0.8); background-color: rgba(255, 0, 60, 0.2); }
-          100% { box-shadow: inset 0 0 0px rgba(255, 0, 60, 0); background-color: rgba(255, 0, 60, 0); }
-        }
+        @keyframes damage-flash { 0% { box-shadow: inset 0 0 0px rgba(255, 0, 60, 0); background-color: rgba(255, 0, 60, 0); } 10% { box-shadow: inset 0 0 150px rgba(255, 0, 60, 0.8); background-color: rgba(255, 0, 60, 0.2); } 100% { box-shadow: inset 0 0 0px rgba(255, 0, 60, 0); background-color: rgba(255, 0, 60, 0); } }
         .damage-overlay { position: absolute; inset: 0; z-index: 3900; pointer-events: none; animation: damage-flash 1.5s ease-out forwards; }
         
-        @keyframes timer-pulse-big {
-          0% { transform: scale(1); }
-          10% { transform: scale(2.5); color: #ff003c; text-shadow: 0 0 30px #ff003c; }
-          100% { transform: scale(1); color: #ff003c; }
-        }
+        @keyframes timer-pulse-big { 0% { transform: scale(1); } 10% { transform: scale(2.5); color: #ff003c; text-shadow: 0 0 30px #ff003c; } 100% { transform: scale(1); color: #ff003c; } }
         .timer-flash { animation: timer-pulse-big 1.5s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+        
+        /* Custom Scrollbar for Chat */
+        .team-chat-msgs::-webkit-scrollbar { width: 5px; }
+        .team-chat-msgs::-webkit-scrollbar-thumb { background: #888; border-radius: 10px; }
       `}</style>
 
       {flashActive && <div className="damage-overlay"></div>}
 
       {!['PROFILE_SETUP', 'START', 'MP_MENU', 'CREATE_LOBBY', 'JOIN_LOBBY'].includes(gameState) && !isWarping && (
         <button onClick={returnHome} style={{...buttonStyle, position: 'absolute', top: '10px', left: '10px', zIndex: 4500, padding: '10px', width: 'auto'}}>← HOME</button>
+      )}
+
+      {/* UPDATED SECURE TEAM CHAT UI - Moved to Top Left & Transparent */}
+      {lobbyCode && lobbyData?.settings.mode === 'TEAMS' && ['LOBBY', 'PLAYING', 'ROUND_OVER', 'GAME_OVER'].includes(gameState) && (
+        <div style={{ position: 'absolute', top: '70px', left: '20px', width: '300px', height: '250px', backgroundColor: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(5px)', border: `2px solid ${myTeamColor}`, borderRadius: '8px', zIndex: 3800, display: 'flex', flexDirection: 'column', overflow: 'hidden', boxShadow: `0 0 20px ${myTeamColor}40`, pointerEvents: 'auto' }}>
+          <div style={{ padding: '5px', backgroundColor: `${myTeamColor}90`, color: '#fff', textAlign: 'center', fontWeight: 'bold', fontSize: '0.8rem', letterSpacing: '2px', borderBottom: `1px solid ${myTeamColor}` }}>SECURE {myPlayer?.team} COMM LINK</div>
+          
+          <div className="team-chat-msgs" style={{ flex: 1, padding: '10px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '0.9rem', fontFamily: '"Outfit", monospace' }}>
+             {lobbyData?.messages?.filter((m:ChatMessage) => m.team === myPlayer?.team).map((m:ChatMessage) => (
+                <div key={m.id} style={{ textAlign: m.sender === playerName ? 'right' : 'left' }}>
+                  <span style={{ fontSize: '0.7rem', opacity: 0.6, display: 'block', marginBottom: '2px', color: '#fff' }}>{m.sender}</span>
+                  <span style={{ display: 'inline-block', background: m.sender === playerName ? myTeamColor : 'rgba(255,255,255,0.2)', color: '#fff', padding: '5px 10px', borderRadius: '4px' }}>{m.text}</span>
+                </div>
+             ))}
+             <div ref={chatEndRef} />
+          </div>
+
+          <form onSubmit={sendChat} style={{ display: 'flex', borderTop: `1px solid ${myTeamColor}`, backgroundColor: 'rgba(0,0,0,0.6)' }}>
+            <input value={chatInput} onChange={e=>setChatInput(e.target.value)} placeholder="MESSAGE TEAM..." style={{ flex: 1, padding: '10px', background: 'transparent', border: 'none', color: '#fff', outline: 'none', fontFamily: '"Outfit", monospace' }} />
+            <button type="submit" disabled={!chatInput.trim()} style={{ background: myTeamColor, color: '#fff', border: 'none', padding: '0 15px', cursor: 'pointer', fontFamily: '"Outfit", monospace' }}>SEND</button>
+          </form>
+        </div>
       )}
 
       <div ref={mapRef} style={{ width: '100%', height: '100%', position: 'absolute', opacity: (['PROFILE_SETUP', 'START', 'MP_MENU', 'CREATE_LOBBY', 'JOIN_LOBBY', 'LOBBY', 'ROUND_OVER', 'GAME_OVER'].includes(gameState) || isWarping) ? 0 : 1, transition: 'opacity 0.6s ease' }} />
@@ -357,7 +440,13 @@ export default function StreetView() {
 
            {lobbyCode ? (
              <div style={{ background: 'rgba(0,0,0,0.8)', padding: '10px', border: '1px solid #00ff41', fontFamily: 'monospace', borderRadius: '4px' }}>
-               {lobbyData?.players.map((p: Player) => <div key={p.id} style={{ color: p.currentGuess ? '#00ff41' : '#fff', margin: '5px 0' }}>{p.currentGuess ? '✅' : '⏳'} {p.name}</div>)}
+               {lobbyData?.players.map((p: Player) => (
+                 <div key={p.id} style={{ color: p.currentGuess ? '#00ff41' : '#fff', margin: '5px 0', display: 'flex', gap: '5px', alignItems: 'center' }}>
+                   {p.currentGuess ? '✅' : '⏳'} 
+                   {lobbyData.settings.mode === 'TEAMS' && <div style={{width: '10px', height: '10px', borderRadius: '50%', backgroundColor: p.team === 'RED' ? '#ff003c' : '#0088ff'}}></div>}
+                   {p.name}
+                 </div>
+               ))}
              </div>
            ) : (
              <div style={{ background: 'rgba(0,0,0,0.8)', padding: '10px', border: '1px solid #00ff41', color: '#00ff41', fontFamily: 'monospace', borderRadius: '4px' }}>
@@ -367,12 +456,11 @@ export default function StreetView() {
         </div>
       )}
 
-      {/* THE FIX: Unified permanent GuessMap that never unmounts! */}
       {['PLAYING', 'ROUND_OVER', 'GAME_OVER'].includes(gameState) && (
         <GuessMap 
           onGuessSelected={setCurrentGuess} 
           actualLocation={gameState !== 'PLAYING' ? actualLocation : null} 
-          allGuesses={gameState === 'PLAYING' ? [] : (lobbyCode && lobbyData ? lobbyData.players : (currentGuess ? [{name: playerName, avatarSeed, currentGuess}] : []))} 
+          allGuesses={gameState === 'PLAYING' ? [] : (lobbyCode && lobbyData ? lobbyData.players : (currentGuess ? [{name: playerName, avatarSeed, team: 'NONE', currentGuess}] : []))} 
           roundKey={roundKey} 
           isLockedIn={isLockedIn} 
         />
@@ -408,9 +496,18 @@ export default function StreetView() {
       {['ROUND_OVER', 'GAME_OVER'].includes(gameState) && lobbyCode && lobbyData && (
         <div style={resultOverlayStyle}>
           <h2 style={{ color: gameState === 'GAME_OVER' ? '#ffd700' : '#00ff41', margin: '0 0 15px 0' }}>{gameState === 'GAME_OVER' ? 'GAME COMPLETE' : `ROUND ${lobbyData.currentRound} COMPLETE`}</h2>
-          <div style={{ textAlign: 'left', borderTop: '1px solid #444' }}>
+          
+          {/* TEAMS SCOREBOARD UPDATED TO USE NEW TEAM SCORE LOGIC */}
+          {lobbyData.settings.mode === 'TEAMS' && (
+             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '20px', borderBottom: '1px solid #444', paddingBottom: '10px' }}>
+                <div style={{ color: '#ff003c', fontWeight: 'bold', fontSize: '1.5rem' }}>RED TEAM<br/>{lobbyData.teamScores?.RED || 0}</div>
+                <div style={{ color: '#0088ff', fontWeight: 'bold', fontSize: '1.5rem', textAlign: 'right' }}>BLUE TEAM<br/>{lobbyData.teamScores?.BLUE || 0}</div>
+             </div>
+          )}
+
+          <div style={{ textAlign: 'left' }}>
             {lobbyData.players.map((p: Player, i: number) => (
-              <div key={p.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid #444' }}>
+              <div key={p.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid #444', borderLeft: lobbyData.settings.mode === 'TEAMS' ? `4px solid ${p.team === 'RED' ? '#ff003c' : '#0088ff'}` : 'none', paddingLeft: lobbyData.settings.mode === 'TEAMS' ? '10px' : '0' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                    <span style={{ fontWeight: 'bold', width: '20px' }}>{i + 1}.</span>
                    <img src={`https://api.dicebear.com/8.x/bottts/svg?seed=${p.avatarSeed}`} alt="avatar" style={{width: '35px', height: '35px', borderRadius: '50%', background: 'rgba(255,255,255,0.1)'}} />
@@ -423,6 +520,7 @@ export default function StreetView() {
               </div>
             ))}
           </div>
+
           {isHost ? (
              <button onClick={gameState === 'GAME_OVER' ? returnHome : handleChaosWarp} style={{...actionButtonStyle(true), marginTop: '20px'}}>{gameState === 'GAME_OVER' ? 'END GAME' : 'NEXT ROUND'}</button>
           ) : <div style={{ color: '#888', marginTop: '20px' }}>WAITING FOR HOST...</div>}
@@ -468,6 +566,12 @@ export default function StreetView() {
       {gameState === 'CREATE_LOBBY' && (
         <form onSubmit={handleCreateLobby} style={{...menuContainerStyle, overflowY: 'auto', padding: '20px 0'}}>
           <h2 style={subtitleStyle}>LOBBY SETTINGS</h2>
+          
+          <div style={{ display: 'flex', gap: '10px', width: '90%', maxWidth: '300px', marginBottom: '10px' }}>
+             <button type="button" onClick={() => setSettings({...settings, mode: 'FFA'})} style={{...actionButtonStyle(settings.mode === 'FFA'), width: '50%', padding: '10px'}}>FFA</button>
+             <button type="button" onClick={() => setSettings({...settings, mode: 'TEAMS'})} style={{...actionButtonStyle(settings.mode === 'TEAMS'), width: '50%', padding: '10px'}}>TEAMS</button>
+          </div>
+
           <div style={{display: 'flex', flexDirection: 'column', gap: '10px', width: '90%', maxWidth: '300px', textAlign: 'left', color: '#aaa', fontSize: '0.8rem'}}>
              <label>ROUND TIME (SEC) <input type="number" value={settings.roundTime} onChange={e=>setSettings({...settings, roundTime: Number(e.target.value)})} style={{...inputStyle, padding: '5px'}}/></label>
              <label>FAST TIMER (SEC) <input type="number" value={settings.fastTimer} onChange={e=>setSettings({...settings, fastTimer: Number(e.target.value)})} style={{...inputStyle, padding: '5px'}}/></label>
@@ -493,14 +597,20 @@ export default function StreetView() {
         <div style={menuContainerStyle}>
           <h2 style={subtitleStyle}>CODE: {lobbyCode}</h2>
           <div style={{ color: '#00ff41', opacity: 0.7 }}>PLAYERS ({lobbyData?.players?.length || 0}/8)</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', width: '90%', maxWidth: '300px', marginBottom: '20px' }}>
+          
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', width: '90%', maxWidth: '400px', marginBottom: '20px' }}>
             {lobbyData?.players.map((p: Player) => (
-              <div key={p.id} style={{ padding: '10px', border: '1px solid #00ff41', background: 'rgba(0,255,65,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div key={p.id} style={{ padding: '10px', border: `1px solid ${lobbyData.settings.mode === 'TEAMS' ? (p.team === 'RED' ? '#ff003c' : '#0088ff') : '#00ff41'}`, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                   <img src={`https://api.dicebear.com/8.x/bottts/svg?seed=${p.avatarSeed}`} alt="avatar" style={{width: '30px', height: '30px', borderRadius: '50%', background: 'rgba(255,255,255,0.1)'}} />
-                  <span>{p.name}</span>
+                  <span style={{ color: lobbyData.settings.mode === 'TEAMS' ? (p.team === 'RED' ? '#ff003c' : '#0088ff') : '#fff' }}>{p.name}</span>
                 </div>
-                {p.isHost && <span style={{fontSize:'0.8rem', opacity:0.7}}>[HOST]</span>}
+                <div style={{display: 'flex', gap: '10px', alignItems: 'center'}}>
+                  {p.id === playerId && lobbyData.settings.mode === 'TEAMS' && (
+                     <button onClick={switchTeam} style={{ background: '#333', color: '#fff', border: 'none', padding: '5px 10px', fontSize: '0.7rem', cursor: 'pointer' }}>SWITCH TEAM</button>
+                  )}
+                  {p.isHost && <span style={{fontSize:'0.8rem', opacity:0.7, color: '#fff'}}>[HOST]</span>}
+                </div>
               </div>
             ))}
           </div>
