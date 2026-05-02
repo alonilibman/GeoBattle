@@ -14,7 +14,7 @@ type GameState = 'PROFILE_SETUP' | 'START' | 'MP_MENU' | 'CREATE_LOBBY' | 'JOIN_
 interface Player {
   id: string;
   name: string;
-  avatarSeed: string; // <-- NEW: Saves the avatar choice!
+  avatarSeed: string;
   isHost: boolean;
   score: number;
   currentGuess: { lat: number, lng: number } | null;
@@ -27,14 +27,17 @@ export default function StreetView() {
   const panoInstance = useRef<any>(null);
   const googleServiceRef = useRef<any>(null);
   
-  // Game starts on PROFILE_SETUP now!
   const [gameState, setGameState] = useState<GameState>('PROFILE_SETUP');
   const [isWarping, setIsWarping] = useState(false);
-  const [diagnostics, setDiagnostics] = useState({ status: 'SYSTEM OFFLINE' });
+  const [diagnostics, setDiagnostics] = useState({ status: 'INITIALIZING...' });
   
   const [currentGuess, setCurrentGuess] = useState<{lat: number, lng: number} | null>(null);
   const [actualLocation, setActualLocation] = useState<{lat: number, lng: number} | null>(null);
   const [roundKey, setRoundKey] = useState(0);
+
+  // --- NEW: BACKGROUND QUEUE STATES ---
+  const [nextQueuedLocation, setNextQueuedLocation] = useState<{lat: number, lng: number} | null>(null);
+  const isPrefetchingRef = useRef(false);
 
   // Global Player Identity
   const [playerName, setPlayerName] = useState('');
@@ -57,7 +60,28 @@ export default function StreetView() {
   const [spRound, setSpRound] = useState(0);
   const [spResult, setSpResult] = useState<{points: number, distance: number, timeout: boolean} | null>(null);
 
-  // Silent Init Google Maps
+  // --- THE BACKGROUND SEARCHER ---
+  const findValidLocation = async (): Promise<{lat: number, lng: number} | null> => {
+    if (!googleServiceRef.current) return null;
+    let attempts = 0;
+    while (attempts < 50) {
+      attempts++;
+      const lat = (Math.random() * 140) - 70;
+      const lng = (Math.random() * 360) - 180;
+      
+      try {
+        const response = await googleServiceRef.current.getPanorama({ location: { lat, lng }, radius: 50000, source: 'outdoor' as any });
+        if (response?.data && response.data.copyright?.includes('Google') && response.data.links?.length) {
+          return { lat: response.data.location.latLng.lat(), lng: response.data.location.latLng.lng() };
+        }
+      } catch (e) { /* Ignore 429s and keep searching */ }
+      
+      await new Promise(res => setTimeout(res, 250)); // Speed limit
+    }
+    return null;
+  };
+
+  // Silent Init Google Maps & Pre-fetch Round 1!
   useEffect(() => {
     let isMounted = true;
     const init = async () => {
@@ -71,6 +95,15 @@ export default function StreetView() {
             addressControl: false, showRoadLabels: false, motionTracking: false, motionTrackingControl: false
           });
         }
+
+        // Start pre-fetching the very first round instantly!
+        if (!isPrefetchingRef.current && !nextQueuedLocation) {
+          isPrefetchingRef.current = true;
+          const loc = await findValidLocation();
+          if (loc && isMounted) setNextQueuedLocation(loc);
+          isPrefetchingRef.current = false;
+        }
+
       } catch (err) { console.error(err); }
     };
     setTimeout(init, 500);
@@ -117,6 +150,7 @@ export default function StreetView() {
     }
   }, [gameState, lobbyData, isHost, lobbyCode, spEndTime]);
 
+  // Follower Warp (For multiplayer clients)
   const executeWarp = (pos: {lat: number, lng: number}) => {
     setIsWarping(true); setGameState('PLAYING'); setRoundKey(prev => prev + 1);
     panoInstance.current.setPosition(pos); panoInstance.current.setPov({ heading: Math.random() * 360, pitch: 0 });
@@ -124,42 +158,53 @@ export default function StreetView() {
     setTimeout(() => setIsWarping(false), 800);
   };
 
+  // Host/Single Player Warp (Uses Queue)
   const handleChaosWarp = async () => {
     if (!googleServiceRef.current || !panoInstance.current) return;
     
     setIsWarping(true); setGameState('PLAYING'); setCurrentGuess(null);
-    setRoundKey(prev => prev + 1); setDiagnostics({ status: 'SEARCHING SIGNAL...' });
+    setRoundKey(prev => prev + 1); 
 
-    let found = false; let attempts = 0;
-    while (!found && attempts < 50) {
-      attempts++;
-      const lat = (Math.random() * 140) - 70; const lng = (Math.random() * 360) - 180;
-      
-      try {
-        const response = await googleServiceRef.current.getPanorama({ location: { lat, lng }, radius: 50000, source: 'outdoor' as any });
-        if (response?.data) {
-          if (!response.data.copyright?.includes('Google') || !response.data.links?.length) { await new Promise(res => setTimeout(res, 250)); continue; }
+    let pos = nextQueuedLocation;
 
-          const pos = { lat: response.data.location.latLng.lat(), lng: response.data.location.latLng.lng() };
-          panoInstance.current.setPosition(pos); setActualLocation(pos);
-          panoInstance.current.setPov({ heading: Math.random() * 360, pitch: 0 });
-          
-          if (lobbyCode && isHost && lobbyData) {
-            const resetPlayers = lobbyData.players.map((p: Player) => ({ ...p, currentGuess: null, distance: null, pointsEarned: null }));
-            await updateDoc(doc(db, 'lobbies', lobbyCode), {
-              status: 'PLAYING', targetLocation: pos, roundEndTime: Date.now() + (lobbyData.settings.roundTime * 1000),
-              currentRound: (lobbyData.currentRound || 0) + 1, players: resetPlayers
-            });
-          } else if (!lobbyCode) {
-            setSpEndTime(Date.now() + (180 * 1000)); setSpRound(prev => prev + 1); setSpResult(null);
-          }
-
-          found = true; setDiagnostics({ status: 'TARGET LOCKED.' });
-          setTimeout(() => setIsWarping(false), 800);
-        }
-      } catch (e) { await new Promise(res => setTimeout(res, 250)); }
+    // If the background prefetch hasn't finished yet, show searching text and wait for it
+    if (!pos) {
+      setDiagnostics({ status: 'SEARCHING SIGNAL...' });
+      pos = await findValidLocation();
     }
-    if (!found) setDiagnostics({ status: 'WARP FAILED. TRY AGAIN.' });
+
+    if (pos) {
+      // Consume the queued location
+      setNextQueuedLocation(null); 
+      panoInstance.current.setPosition(pos); setActualLocation(pos);
+      panoInstance.current.setPov({ heading: Math.random() * 360, pitch: 0 });
+      
+      if (lobbyCode && isHost && lobbyData) {
+        const resetPlayers = lobbyData.players.map((p: Player) => ({ ...p, currentGuess: null, distance: null, pointsEarned: null }));
+        await updateDoc(doc(db, 'lobbies', lobbyCode), {
+          status: 'PLAYING', targetLocation: pos, roundEndTime: Date.now() + (lobbyData.settings.roundTime * 1000),
+          currentRound: (lobbyData.currentRound || 0) + 1, players: resetPlayers
+        });
+      } else if (!lobbyCode) {
+        setSpEndTime(Date.now() + (180 * 1000)); setSpRound(prev => prev + 1); setSpResult(null);
+      }
+
+      setDiagnostics({ status: 'TARGET LOCKED.' });
+      setTimeout(() => setIsWarping(false), 800);
+
+      // SILENTLY START SEARCHING FOR THE NEXT ROUND IN THE BACKGROUND!
+      if (!isPrefetchingRef.current) {
+         isPrefetchingRef.current = true;
+         findValidLocation().then(newLoc => {
+            if (newLoc) setNextQueuedLocation(newLoc);
+            isPrefetchingRef.current = false;
+         });
+      }
+
+    } else {
+      setDiagnostics({ status: 'WARP FAILED. TRY AGAIN.' });
+      setTimeout(() => setIsWarping(false), 1500);
+    }
   };
 
   const calculateDistance = (p1: any, p2: any) => {
@@ -305,7 +350,6 @@ export default function StreetView() {
 
       {gameState === 'ROUND_OVER' && !lobbyCode && spResult && (
         <>
-          {/* Note: Pass the player's name AND their chosen avatar seed to the map here! */}
           <GuessMap onGuessSelected={() => {}} actualLocation={actualLocation} allGuesses={currentGuess ? [{name: playerName, avatarSeed: avatarSeed, currentGuess}] : []} roundKey={roundKey} />
           <div style={resultOverlayStyle}>
             <div style={{ fontSize: '1.2rem', marginBottom: '15px', borderBottom: '1px solid #00ff41', paddingBottom: '5px' }}>{spResult.timeout ? 'SIGNAL LOST' : 'MISSION COMPLETE'}</div>
@@ -342,26 +386,18 @@ export default function StreetView() {
         </>
       )}
 
-      {/* --- NEW: THE PROFILE ONBOARDING SCREEN --- */}
       {gameState === 'PROFILE_SETUP' && (
         <div style={menuContainerStyle}>
           <h1 style={titleStyle}>GEOBATTLE</h1>
           <div style={{ color: '#00ff41', opacity: 0.7, marginBottom: '20px', fontFamily: 'monospace' }}>AGENT INITIALIZATION</div>
-
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '15px', marginBottom: '30px' }}>
             <div style={{ width: '120px', height: '120px', border: '2px solid #00ff41', borderRadius: '50%', backgroundColor: 'rgba(0,255,65,0.1)', overflow: 'hidden', padding: '10px' }}>
               <img src={`https://api.dicebear.com/8.x/bottts/svg?seed=${avatarSeed}`} alt="Avatar" style={{ width: '100%', height: '100%' }} />
             </div>
-            <button type="button" onClick={() => setAvatarSeed(Math.random().toString(36).substring(2, 9))} style={{ ...buttonStyle, padding: '5px 15px', fontSize: '0.8rem', width: 'auto' }}>
-              [ RE-ROLL AVATAR ]
-            </button>
+            <button type="button" onClick={() => setAvatarSeed(Math.random().toString(36).substring(2, 9))} style={{ ...buttonStyle, padding: '5px 15px', fontSize: '0.8rem', width: 'auto' }}>[ RE-ROLL AVATAR ]</button>
           </div>
-
           <input autoFocus placeholder="ENTER CALLSIGN" value={playerName} onChange={(e) => setPlayerName(e.target.value.toLowerCase())} style={{ ...inputStyle, textAlign: 'center', fontSize: '1.5rem', letterSpacing: '2px' }} maxLength={15} />
-
-          <button onClick={() => setGameState('START')} disabled={!playerName.trim()} style={actionButtonStyle(!!playerName.trim())}>
-            ACCESS TERMINAL
-          </button>
+          <button onClick={() => setGameState('START')} disabled={!playerName.trim()} style={actionButtonStyle(!!playerName.trim())}>ACCESS TERMINAL</button>
         </div>
       )}
 
